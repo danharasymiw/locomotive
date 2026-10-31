@@ -29,7 +29,7 @@ In the history view, move the cursor with `←`/`→` (`shift` jumps 10 commits)
 
 ### Departures board
 
-These come from a made-up repo, so no real names or code are shown. Switch between them with `m`.
+Switch between them with `m`.
 
 **total**: lines of code at every commit.
 
@@ -55,6 +55,10 @@ These come from a made-up repo, so no real names or code are shown. Switch betwe
 
 ![who uses ai](docs/who.svg)
 
+**worktrees**: net uncommitted lines for every worktree at once. A locked worktree is tagged `[agent]`.
+
+![worktrees](docs/worktrees.svg)
+
 ### Timetable
 
 | Flag | Meaning |
@@ -64,7 +68,7 @@ These come from a made-up repo, so no real names or code are shown. Switch betwe
 | `--branch main` | branch or ref to walk (default `HEAD`) |
 | `--author me` | only commits by this author |
 | `--since 6m` | history window: `1m`, `3m` (default), `6m`, `1y`, `all` or a date like `2025-01-01` |
-| `--once` | print the chart once and exit (`--mode total\|languages\|churn\|worktrees`) |
+| `--once` | print the chart once and exit (`--mode total\|languages\|churn\|authors\|ai\|who\|worktrees`) |
 | `--json`, `--csv` | print per-commit data and exit |
 
 Lockfiles, vendored dependencies, build output and common generated code (protobuf, minified JS and so on) are ignored by default. See `excludes` in `git.go`. Paths marked `linguist-generated` or `linguist-vendored` in `.gitattributes` are ignored too. Git applies the current attributes to the whole history, and needs 2.13 or newer.

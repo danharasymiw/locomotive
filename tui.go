@@ -316,7 +316,9 @@ func (m model) draw() (string, geom) {
 		for i, s := range m.wt {
 			ss = append(ss, series{s.wt.name, palette[i%len(palette)], m.wtPts[s.wt.name]})
 		}
-		body, g := render(w, m.chartH(), ss, true, nil)
+		// the legend takes one row per worktree, so the chart gives up the rows beyond the first
+		h := max(m.chartH()-max(len(m.wt)-1, 0), 5)
+		body, g := render(w, h, ss, true, nil)
 		return body + "\n" + m.wtLegend(ss), g
 	}
 	var cursor *time.Time
