@@ -22,10 +22,14 @@ const (
 	modeTotal mode = iota
 	modeLang
 	modeChurn
+	modeAuthors
+	modeAI
 	numModes
 )
 
-func (m mode) String() string { return [...]string{"total", "languages", "churn"}[m] }
+func (m mode) String() string {
+	return [...]string{"total", "languages", "churn", "authors", "human vs ai"}[m]
+}
 
 type view int
 
@@ -205,11 +209,17 @@ func (m model) seriesFor() []series {
 	cs := m.hist.Commits
 	switch m.mode {
 	case modeLang:
-		total := totalSeries(cs)
-		total[0].color = lipgloss.Color("255") // palette already uses the default blue
-		return append(total, languageSeries(cs, 5)...)
+		return append([]series{whiteTotal(cs)}, languageSeries(cs, 5)...)
 	case modeChurn:
 		return churnSeries(cs)
+	case modeAuthors:
+		return append([]series{whiteTotal(cs)}, groupSeries(cs, authorKey, 5)...)
+	case modeAI:
+		ss := groupSeries(cs, aiKey, 2)
+		for i := range ss {
+			ss[i].color = map[string]lipgloss.Color{"human": "39", "ai-assisted": "208"}[ss[i].name]
+		}
+		return append([]series{whiteTotal(cs)}, ss...)
 	}
 	return totalSeries(cs)
 }
@@ -295,6 +305,30 @@ func (m model) info() string {
 		var parts []string
 		for _, e := range exts[:min(len(exts), 6)] {
 			parts = append(parts, fmt.Sprintf("%s %s", e, commas(c.ByExt[e])))
+		}
+		s += "\n" + axisStyle.Render(strings.Join(parts, " · "))
+	}
+	var key func(commit) string
+	switch m.mode {
+	case modeAuthors:
+		key = authorKey
+	case modeAI:
+		key = aiKey
+	}
+	if key != nil {
+		run := groupTotals(m.hist.Commits, m.cur, key)
+		var names []string
+		for n := range run {
+			names = append(names, n)
+		}
+		sort.Slice(names, func(i, j int) bool { return run[names[i]] > run[names[j]] })
+		var parts []string
+		for _, n := range names[:min(len(names), 6)] {
+			part := fmt.Sprintf("%s %s", n, commas(run[n]))
+			if m.mode == modeAI && c.Total > 0 {
+				part += fmt.Sprintf(" (%d%%)", run[n]*100/c.Total)
+			}
+			parts = append(parts, part)
 		}
 		s += "\n" + axisStyle.Render(strings.Join(parts, " · "))
 	}

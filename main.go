@@ -18,7 +18,7 @@ func main() {
 	var (
 		o       opts
 		once    = flag.Bool("once", false, "print the chart once and exit")
-		modeArg = flag.String("mode", "total", "with -once: total, languages or churn")
+		modeArg = flag.String("mode", "total", "with -once: total, languages, churn, authors, ai or worktrees")
 		asJSON  = flag.Bool("json", false, "print per-commit data as JSON and exit")
 		asCSV   = flag.Bool("csv", false, "print per-commit data as CSV and exit")
 		exts    = flag.String("ext", "", "only count these extensions, comma separated (e.g. go,ts)")
@@ -80,7 +80,7 @@ func main() {
 		m.cur = len(h.Commits) - 1
 		m.stat, _ = loadLive(o)
 		for i := range numModes {
-			if i.String() == *modeArg {
+			if s := i.String(); s == *modeArg || (i == modeAI && *modeArg == "ai") {
 				m.mode = i
 			}
 		}
@@ -115,6 +115,7 @@ func writeJSON(cs []commit) {
 		Hash    string         `json:"hash"`
 		Author  string         `json:"author"`
 		Subject string         `json:"subject"`
+		AI      bool           `json:"ai"`
 		Total   int            `json:"total"`
 		Added   int            `json:"added"`
 		Deleted int            `json:"deleted"`
@@ -122,7 +123,7 @@ func writeJSON(cs []commit) {
 	}
 	rows := make([]row, len(cs))
 	for i, c := range cs {
-		rows[i] = row{c.T.Format("2006-01-02T15:04:05Z07:00"), c.Hash, c.Author, c.Subject, c.Total, c.Added, c.Deleted, c.ByExt}
+		rows[i] = row{c.T.Format("2006-01-02T15:04:05Z07:00"), c.Hash, c.Author, c.Subject, c.AI, c.Total, c.Added, c.Deleted, c.ByExt}
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -131,10 +132,10 @@ func writeJSON(cs []commit) {
 
 func writeCSV(cs []commit) {
 	w := csv.NewWriter(os.Stdout)
-	w.Write([]string{"time", "hash", "author", "subject", "total", "added", "deleted"})
+	w.Write([]string{"time", "hash", "author", "subject", "ai", "total", "added", "deleted"})
 	for _, c := range cs {
 		w.Write([]string{c.T.Format("2006-01-02T15:04:05Z07:00"), c.Hash, c.Author, c.Subject,
-			strconv.Itoa(c.Total), strconv.Itoa(c.Added), strconv.Itoa(c.Deleted)})
+			strconv.FormatBool(c.AI), strconv.Itoa(c.Total), strconv.Itoa(c.Added), strconv.Itoa(c.Deleted)})
 	}
 	w.Flush()
 }

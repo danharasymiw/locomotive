@@ -170,6 +170,76 @@ func languageSeries(cs []commit, top int) []series {
 	return ss
 }
 
+// whiteTotal is the total line drawn over breakdown views (palette already uses the default blue).
+func whiteTotal(cs []commit) series {
+	t := totalSeries(cs)[0]
+	t.color = lipgloss.Color("255")
+	return t
+}
+
+func authorKey(c commit) string { return c.Author }
+
+func aiKey(c commit) string {
+	if c.AI {
+		return "ai-assisted"
+	}
+	return "human"
+}
+
+// groupSeries plots each group's running net lines (added minus deleted), ranking groups
+// by total lines added and folding everything past top into "other".
+func groupSeries(cs []commit, key func(commit) string, top int) []series {
+	added := map[string]int{}
+	for _, c := range cs {
+		added[key(c)] += c.Added
+	}
+	names := make([]string, 0, len(added))
+	for n := range added {
+		names = append(names, n)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if added[names[i]] != added[names[j]] {
+			return added[names[i]] > added[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	keep := names[:min(top, len(names))]
+	isKept := map[string]bool{}
+	ss := make([]series, len(keep))
+	for i, n := range keep {
+		isKept[n] = true
+		ss[i] = series{name: n, color: palette[i%len(palette)]}
+	}
+	other := series{name: "other", color: palette[len(palette)-1]}
+	run := map[string]int{}
+	for _, c := range cs {
+		run[key(c)] += c.Added - c.Deleted
+		rest := 0
+		for n, v := range run {
+			if !isKept[n] {
+				rest += v
+			}
+		}
+		for i, n := range keep {
+			ss[i].pts = append(ss[i].pts, point{c.T, float64(run[n])})
+		}
+		other.pts = append(other.pts, point{c.T, float64(rest)})
+	}
+	if len(names) > top {
+		ss = append(ss, other)
+	}
+	return ss
+}
+
+// groupTotals returns each group's running net lines through commit index upto.
+func groupTotals(cs []commit, upto int, key func(commit) string) map[string]int {
+	run := map[string]int{}
+	for _, c := range cs[:min(upto+1, len(cs))] {
+		run[key(c)] += c.Added - c.Deleted
+	}
+	return run
+}
+
 func churnSeries(cs []commit) []series {
 	add := series{name: "added", color: lipgloss.Color("42")}
 	del := series{name: "deleted", color: lipgloss.Color("203")}

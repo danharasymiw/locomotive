@@ -71,7 +71,7 @@ func (o opts) key() string {
 		exts = append(exts, e)
 	}
 	sort.Strings(exts)
-	parts := []string{abs, o.rev(), o.author, o.since, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v2"}
+	parts := []string{abs, o.rev(), o.author, o.since, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v3"}
 	sum := sha1.Sum([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:8])
 }
@@ -119,8 +119,14 @@ func parseNumstat(line string) (added, deleted int, path string, ok bool) {
 	return a, d, f[2], true
 }
 
+var aiName = regexp.MustCompile(`(?i)claude|anthropic|copilot|cursor|aider|codex|gemini|openai|chatgpt|devin|windsurf`)
+
+// aiTrailer reports whether any Co-Authored-By value names a known coding agent.
+func aiTrailer(trailers string) bool { return aiName.MatchString(trailers) }
+
 type commit struct {
 	Hash, Author, Subject string
+	AI                    bool // a Co-Authored-By trailer names a coding agent
 	T                     time.Time
 	Total, Added, Deleted int
 	ByExt                 map[string]int
@@ -150,7 +156,7 @@ func loadHistory(o opts, prev history) (history, error) {
 		}
 	}
 
-	args := []string{"log", "--reverse", "--no-merges", "-M", "--format=@%H%x09%ct%x09%an%x09%s", "--numstat"}
+	args := []string{"log", "--reverse", "--no-merges", "-M", "--format=@%H%x09%ct%x09%aN%x09%(trailers:key=Co-Authored-By,valueonly,unfold,separator=%x1F)%x09%s", "--numstat"}
 	if o.author != "" {
 		args = append(args, "--author="+o.author)
 	}
@@ -188,9 +194,9 @@ func loadHistory(o opts, prev history) (history, error) {
 		switch {
 		case strings.HasPrefix(line, "@"):
 			flush()
-			f := append(strings.SplitN(line[1:], "\t", 4), "", "", "", "")
+			f := append(strings.SplitN(line[1:], "\t", 5), "", "", "", "", "")
 			secs, _ := strconv.ParseInt(f[1], 10, 64)
-			cur = &commit{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], Subject: f[3]}
+			cur = &commit{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], AI: aiTrailer(f[3]), Subject: f[4]}
 		case line != "" && cur != nil:
 			if a, d, p, ok := parseNumstat(line); ok && o.wants(p) {
 				total += a - d

@@ -21,7 +21,7 @@ slopmeter
 
 `tab` cycles between three views:
 
-- **history** plots lines of code at every commit. `m` switches between *total*, *languages* (one line per extension, plus a total) and *churn* (lines added vs deleted per commit).
+- **history** plots lines of code at every commit. `m` switches between *total*, *languages* (one line per extension, plus a total), *churn* (lines added vs deleted per commit), *authors* (running net lines per person, mailmap-aware) and *human vs ai*. The AI split classifies a commit as AI-assisted when a `Co-Authored-By` trailer names a coding agent (Claude, Copilot, Cursor, Aider, Codex, Gemini and similar), so commits without that trailer count as human.
 - **live** plots your working tree (uncommitted changes plus untracked files) once a second.
 - **worktrees** plots net uncommitted lines for every worktree of the repo at once. A worktree is tagged `[session]` when a `claude` process is running in it and `[agent]` when git has it locked, which is how Claude Code subagent worktrees appear.
 
