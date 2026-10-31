@@ -35,6 +35,18 @@ func (m mode) String() string {
 // brand is the dim name tag shown next to the tabs and above -once output.
 var brand = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("LoComotive")
 
+// withBrand right-aligns the brand tag on the first line of s, when there is room.
+func withBrand(s string, w int) string {
+	first, rest, more := strings.Cut(s, "\n")
+	if pad := w - lipgloss.Width(first) - lipgloss.Width(brand); pad >= 2 {
+		first += strings.Repeat(" ", pad) + brand
+	}
+	if more {
+		return first + "\n" + rest
+	}
+	return first
+}
+
 type view int
 
 const (

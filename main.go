@@ -91,8 +91,7 @@ func main() {
 			}
 		}
 		body, _ := m.draw()
-		fmt.Println(brand)
-		fmt.Println(m.header())
+		fmt.Println(withBrand(m.header(), m.w))
 		fmt.Println(body)
 		fmt.Println(m.info())
 	default:
