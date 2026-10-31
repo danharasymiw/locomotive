@@ -46,8 +46,10 @@ type (
 		err   error
 	}
 	histMsg struct {
-		h   history
-		err error
+		h     history
+		led   ledger
+		since time.Time // the window it was loaded for, so stale results can be dropped
+		err   error
 	}
 	liveMsg struct {
 		s   liveStat
@@ -58,7 +60,10 @@ type (
 
 type model struct {
 	o          opts
+	label      string // history window shown to the user (3m, all, ...)
+	loaded     bool   // history has arrived for the current window
 	hist       history
+	led        ledger // cached commit log; windows are cut from it
 	live       []point
 	stat       liveStat
 	head       string
@@ -72,7 +77,9 @@ type model struct {
 	err        error
 }
 
-func newModel(o opts) model { return model{o: o, followLast: true, wtPts: map[string][]point{}} }
+func newModel(o opts, label string) model {
+	return model{o: o, label: label, followLast: true, wtPts: map[string][]point{}}
+}
 
 func (m model) Init() tea.Cmd { return tea.Batch(m.loadHist(false), m.poll(), m.pollWT(), tick()) }
 
@@ -87,10 +94,10 @@ func (m model) pollWT() tea.Cmd {
 func tick() tea.Cmd { return tea.Tick(pollEvery, func(time.Time) tea.Msg { return tickMsg{} }) }
 
 func (m model) loadHist(force bool) tea.Cmd {
-	o, prev := m.o, m.hist
+	o, led := m.o, m.led
 	return func() tea.Msg {
-		h, err := loadCached(o, prev, force)
-		return histMsg{h, err}
+		h, led, err := loadCached(o, led, force)
+		return histMsg{h, led, o.since, err}
 	}
 }
 
@@ -145,6 +152,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.live = nil
 			return m, m.loadHist(true)
+		case "p":
+			next := 0
+			for i, p := range periods {
+				if p.label == m.label {
+					next = (i + 1) % len(periods)
+				}
+			}
+			m.o.since, m.label, _ = resolveSince(periods[next].label)
+			m.hist, m.loaded, m.cur, m.followLast, m.live = history{}, false, 0, true, nil
+			return m, m.loadHist(false)
 		}
 	case tea.MouseMsg:
 		motion := msg.Action == tea.MouseActionMotion
@@ -162,9 +179,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case histMsg:
+		if !msg.since.Equal(m.o.since) {
+			break // the window changed while this was loading
+		}
 		m.err = msg.err
 		if msg.err == nil {
-			m.hist = msg.h
+			m.hist, m.led, m.loaded = msg.h, msg.led, true
 			if m.followLast || m.cur >= len(m.hist.Commits) {
 				m.cur = max(0, len(m.hist.Commits)-1)
 			}
@@ -239,7 +259,7 @@ func (m model) draw() (string, geom) {
 		return body + "\n" + m.wtLegend(ss), g
 	}
 	var cursor *time.Time
-	if m.cur < len(m.hist.Commits) {
+	if len(m.hist.Commits) > 0 && m.cur < len(m.hist.Commits) {
 		t := m.hist.Commits[m.cur].T
 		cursor = &t
 	}
@@ -258,7 +278,13 @@ func (m model) header() string {
 	dim := axisStyle
 
 	total := int(m.base()) + m.stat.delta()
-	s := bold.Render(commas(total)+" lines") + dim.Render(fmt.Sprintf("  %d commits  ", len(m.hist.Commits)))
+	s := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Render(m.o.name) + "  "
+	if len(m.hist.Commits) > 0 {
+		s += bold.Render(commas(total) + " lines")
+	} else {
+		s += bold.Render("no commits in " + m.label) // base is unknown without any commit in the window
+	}
+	s += dim.Render(fmt.Sprintf("  %d commits  ", len(m.hist.Commits)))
 	s += green.Render(fmt.Sprintf("+%s", commas(m.stat.added+m.stat.untracked))) + " " + red.Render(fmt.Sprintf("-%s", commas(m.stat.deleted)))
 	s += dim.Render(" uncommitted")
 	if len(m.live) > 0 {
@@ -283,7 +309,7 @@ func (m model) wtLegend(ss []series) string {
 }
 
 func (m model) info() string {
-	if m.view != viewHist || m.cur >= len(m.hist.Commits) {
+	if m.view != viewHist || len(m.hist.Commits) == 0 || m.cur >= len(m.hist.Commits) {
 		return ""
 	}
 	c := m.hist.Commits[m.cur]
@@ -348,7 +374,7 @@ func (m model) View() string {
 	}
 	histLabel := "history"
 	if m.view == viewHist {
-		histLabel += " (" + m.mode.String() + ")" // mode only applies to this view
+		histLabel += " (" + m.mode.String() + " · " + m.label + ")" // these only apply to this view
 	}
 	tabs := tab(histLabel, m.view == viewHist) + "  " +
 		tab("live", m.view == viewLive) + "  " + tab("worktrees", m.view == viewWT)
@@ -357,11 +383,13 @@ func (m model) View() string {
 	switch {
 	case m.err != nil:
 		body = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render(m.err.Error())
+	case !m.loaded && m.view == viewHist:
+		body = "loading " + m.label + " of history…"
 	case len(m.hist.Commits) == 0 && m.view == viewHist:
-		body = "loading history…"
+		body = "no commits in the last " + m.label + " — press p for a longer window"
 	default:
 		body, _ = m.draw()
 	}
-	help := axisStyle.Render("tab view · m mode · ←/→ cursor (shift ×10) · r reload · q quit")
+	help := axisStyle.Render("tab view · m mode · p period · ←/→ cursor (shift ×10) · r reload · q quit")
 	return strings.Join([]string{m.header(), tabs, "", body, m.info(), help}, "\n")
 }

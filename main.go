@@ -26,7 +26,7 @@ func main() {
 	)
 	flag.StringVar(&o.branch, "branch", "", "branch or ref to walk (default HEAD)")
 	flag.StringVar(&o.author, "author", "", "only count commits by this author (git --author pattern)")
-	flag.StringVar(&o.since, "since", "", "only count commits since this date (e.g. 6.months)")
+	sinceArg := flag.String("since", "", "history window: 1m, 3m, 6m, 1y, all, or a date like 2025-01-01 (default 3m)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: slopmeter [flags] [repo-dir]")
 		flag.PrintDefaults()
@@ -36,6 +36,12 @@ func main() {
 	o.dir = "."
 	if flag.NArg() > 0 {
 		o.dir = flag.Arg(0)
+	}
+	o.name = repoName(o.dir)
+	var label string
+	var err error
+	if o.since, label, err = resolveSince(*sinceArg); err != nil {
+		fatal(err.Error())
 	}
 	o.exts = map[string]bool{}
 	for _, e := range splitList(*exts) {
@@ -49,7 +55,7 @@ func main() {
 
 	switch {
 	case *asJSON || *asCSV:
-		h, err := loadCached(o, history{}, false)
+		h, _, err := loadCached(o, ledger{}, false)
 		if err != nil {
 			fatal(err.Error())
 		}
@@ -63,7 +69,7 @@ func main() {
 		if err != nil {
 			fatal(err.Error())
 		}
-		m := newModel(o)
+		m := newModel(o, label)
 		m.w, m.wt = 100, stats
 		ss := make([]series, len(stats))
 		for i := range stats {
@@ -71,13 +77,13 @@ func main() {
 		}
 		fmt.Println(m.wtLegend(ss))
 	case *once:
-		h, err := loadCached(o, history{}, false)
+		h, _, err := loadCached(o, ledger{}, false)
 		if err != nil {
 			fatal(err.Error())
 		}
-		m := newModel(o)
-		m.hist, m.w, m.h = h, 100, 28
-		m.cur = len(h.Commits) - 1
+		m := newModel(o, label)
+		m.hist, m.loaded, m.w, m.h = h, true, 100, 28
+		m.cur = max(0, len(h.Commits)-1)
 		m.stat, _ = loadLive(o)
 		for i := range numModes {
 			if s := i.String(); s == *modeArg || (i == modeAI && *modeArg == "ai") {
@@ -89,7 +95,7 @@ func main() {
 		fmt.Println(body)
 		fmt.Println(m.info())
 	default:
-		if _, err := tea.NewProgram(newModel(o), tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
+		if _, err := tea.NewProgram(newModel(o, label), tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 			fatal(err.Error())
 		}
 	}

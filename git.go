@@ -46,9 +46,71 @@ func exclude(globs ...string) []string {
 }
 
 type opts struct {
-	dir, branch, author, since string
-	exts                       map[string]bool // lowercase, no leading dot; empty = all
-	exclude                    []string        // extra globs
+	dir, name      string // name is display only, not part of the cache key
+	branch, author string
+	since          time.Time       // start of the history window; zero = all
+	exts           map[string]bool // lowercase, no leading dot; empty = all
+	exclude        []string        // extra globs
+}
+
+// repoName names the repository, not the checkout: a linked worktree reports its main repo.
+func repoName(dir string) string {
+	if out, err := git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir"); err == nil {
+		if common := strings.TrimSpace(string(out)); filepath.Base(common) == ".git" {
+			return filepath.Base(filepath.Dir(common))
+		}
+	}
+	abs, _ := filepath.Abs(dir)
+	return filepath.Base(abs)
+}
+
+var periods = []struct {
+	label  string
+	months int // 0 = all history
+}{{"1m", 1}, {"3m", 3}, {"6m", 6}, {"1y", 12}, {"all", 0}}
+
+// resolveSince turns a window label or a YYYY-MM-DD date into a start time (zero = all history).
+func resolveSince(s string) (time.Time, string, error) {
+	if s == "" {
+		s = "3m"
+	}
+	for _, p := range periods {
+		if p.label == s {
+			if p.months == 0 {
+				return time.Time{}, s, nil
+			}
+			return time.Now().AddDate(0, -p.months, 0), s, nil
+		}
+	}
+	t, err := time.ParseInLocation("2006-01-02", s, time.Local)
+	if err != nil {
+		return time.Time{}, s, fmt.Errorf("bad --since %q: use 1m, 3m, 6m, 1y, all or YYYY-MM-DD", s)
+	}
+	return t, s, nil
+}
+
+// loadBaseline counts the lines in every tracked text file at rev, in total and per extension.
+func loadBaseline(o opts, rev string) (int, map[string]int, error) {
+	args := append([]string{"grep", "-I", "-c", "", rev}, o.pathspec()...)
+	out, err := git(o.dir, args...)
+	if err != nil {
+		return 0, nil, err
+	}
+	total, by := 0, map[string]int{}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimPrefix(line, rev+":")
+		i := strings.LastIndex(line, ":")
+		if i < 0 {
+			continue
+		}
+		n, err := strconv.Atoi(line[i+1:])
+		if err != nil || !o.wants(line[:i]) {
+			continue
+		}
+		total += n
+		by[extOf(line[:i])] += n
+	}
+	return total, by, nil
 }
 
 func (o opts) pathspec() []string {
@@ -71,7 +133,7 @@ func (o opts) key() string {
 		exts = append(exts, e)
 	}
 	sort.Strings(exts)
-	parts := []string{abs, o.rev(), o.author, o.since, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v3"}
+	parts := []string{abs, o.rev(), o.author, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v4"}
 	sum := sha1.Sum([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:8])
 }
@@ -132,61 +194,52 @@ type commit struct {
 	ByExt                 map[string]int
 }
 
+// history is what the UI plots: the commits inside the chosen window, with running totals.
 type history struct {
 	Head    string
 	Commits []commit
 }
 
-// loadHistory walks commits oldest first. With a prev from the same opts it only reads new commits.
-func loadHistory(o opts, prev history) (history, error) {
-	out, err := git(o.dir, "rev-parse", o.rev())
-	if err != nil {
-		return history{}, err
-	}
-	head := strings.TrimSpace(string(out))
-	if prev.Head == head {
-		return prev, nil
-	}
-	rev := head
-	if prev.Head != "" {
-		if _, err := git(o.dir, "merge-base", "--is-ancestor", prev.Head, head); err == nil {
-			rev = prev.Head + ".." + head
-		} else {
-			prev = history{} // history was rewritten
-		}
-	}
+// delta is one commit's effect on line counts, independent of any window.
+type delta struct {
+	Hash, Author, Subject string
+	AI                    bool
+	T                     time.Time
+	Added, Deleted        int
+	ByExt                 map[string]int // net lines per extension
+}
 
-	args := []string{"log", "--reverse", "--no-merges", "-M", "--format=@%H%x09%ct%x09%aN%x09%(trailers:key=Co-Authored-By,valueonly,unfold,separator=%x1F)%x09%s", "--numstat"}
+// ledger is the cached commit log. It holds every commit reachable from Head with a commit time
+// at or after From (or all of history when All), so any window inside that range needs no git walk.
+type ledger struct {
+	Head   string
+	From   time.Time
+	All    bool
+	Deltas []delta // oldest first
+}
+
+func gitDate(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z") }
+
+// fetchDeltas reads commits oldest first. args select them (date limits and a rev or range).
+func fetchDeltas(o opts, args ...string) ([]delta, error) {
+	full := []string{"log", "--reverse", "--no-merges", "-M", "--numstat",
+		"--format=@%H%x09%ct%x09%aN%x09%(trailers:key=Co-Authored-By,valueonly,unfold,separator=%x1F)%x09%s"}
 	if o.author != "" {
-		args = append(args, "--author="+o.author)
+		full = append(full, "--author="+o.author)
 	}
-	if o.since != "" {
-		args = append(args, "--since="+o.since)
-	}
-	args = append(append(args, rev), o.pathspec()...)
-	out, err = git(o.dir, args...)
+	out, err := git(o.dir, append(append(full, args...), o.pathspec()...)...)
 	if err != nil {
-		return history{}, err
+		return nil, err
 	}
-
-	commits := append([]commit(nil), prev.Commits...)
-	total, by := 0, map[string]int{}
-	if n := len(commits); n > 0 {
-		total = commits[n-1].Total
-		maps.Copy(by, commits[n-1].ByExt)
-	}
-	var cur *commit
+	var (
+		ds  []delta
+		cur *delta
+	)
 	flush := func() {
-		if cur == nil {
-			return
+		if cur != nil {
+			ds = append(ds, *cur)
 		}
-		if n := len(commits); n > 0 && cur.T.Before(commits[n-1].T) {
-			cur.T = commits[n-1].T // rebased commits can have out-of-order timestamps
-		}
-		cur.Total, cur.ByExt = total, maps.Clone(by)
-		commits = append(commits, *cur)
 	}
-
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -196,18 +249,136 @@ func loadHistory(o opts, prev history) (history, error) {
 			flush()
 			f := append(strings.SplitN(line[1:], "\t", 5), "", "", "", "", "")
 			secs, _ := strconv.ParseInt(f[1], 10, 64)
-			cur = &commit{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], AI: aiTrailer(f[3]), Subject: f[4]}
+			cur = &delta{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], AI: aiTrailer(f[3]), Subject: f[4], ByExt: map[string]int{}}
 		case line != "" && cur != nil:
 			if a, d, p, ok := parseNumstat(line); ok && o.wants(p) {
-				total += a - d
-				by[extOf(p)] += a - d
 				cur.Added += a
 				cur.Deleted += d
+				cur.ByExt[extOf(p)] += a - d
 			}
 		}
 	}
 	flush()
-	return history{Head: head, Commits: commits}, sc.Err()
+	return ds, sc.Err()
+}
+
+// syncLedger brings led up to date: new commits on top, and older ones if since reaches
+// back further than what is already covered. Only the missing range is read from git.
+func syncLedger(o opts, led ledger, since time.Time) (ledger, error) {
+	out, err := git(o.dir, "rev-parse", o.rev())
+	if err != nil {
+		return ledger{}, err
+	}
+	head := strings.TrimSpace(string(out))
+	if led.Head != "" && led.Head != head {
+		if _, err := git(o.dir, "merge-base", "--is-ancestor", led.Head, head); err != nil {
+			led = ledger{} // history was rewritten
+		} else {
+			newer, err := fetchDeltas(o, led.Head+".."+head)
+			if err != nil {
+				return ledger{}, err
+			}
+			led.Deltas, led.Head = append(led.Deltas, newer...), head
+		}
+	}
+	if led.Head == "" {
+		args := []string{head}
+		if !since.IsZero() {
+			args = []string{"--since=" + gitDate(since), head}
+		}
+		ds, err := fetchDeltas(o, args...)
+		return ledger{Head: head, From: since, All: since.IsZero(), Deltas: ds}, err
+	}
+	if !led.All && (since.IsZero() || since.Before(led.From)) {
+		// the 24h overlap guards the boundary; duplicates are dropped by hash
+		args := []string{"--until=" + gitDate(led.From.Add(24*time.Hour)), head}
+		if !since.IsZero() {
+			args = append([]string{"--since=" + gitDate(since)}, args...)
+		}
+		older, err := fetchDeltas(o, args...)
+		if err != nil {
+			return ledger{}, err
+		}
+		have := make(map[string]bool, len(led.Deltas))
+		for _, d := range led.Deltas {
+			have[d.Hash] = true
+		}
+		merged := make([]delta, 0, len(older)+len(led.Deltas))
+		for _, d := range older {
+			if !have[d.Hash] {
+				merged = append(merged, d)
+			}
+		}
+		led.Deltas, led.From, led.All = append(merged, led.Deltas...), since, since.IsZero()
+	}
+	return led, nil
+}
+
+// derive builds the plotted history for a window: running totals over the whole ledger, cut to
+// the commits at or after since, then shifted so the numbers mean something.
+func derive(o opts, led ledger, since time.Time) history {
+	var (
+		win     []commit
+		total   int
+		by      = map[string]int{}
+		base0   int
+		base0By map[string]int
+		started bool
+		prevT   time.Time
+	)
+	for _, d := range led.Deltas {
+		t := d.T
+		if t.Before(prevT) {
+			t = prevT // rebased commits can have out-of-order timestamps
+		}
+		prevT = t
+		if !started && (since.IsZero() || !t.Before(since)) {
+			started, base0, base0By = true, total, maps.Clone(by)
+		}
+		total += d.Added - d.Deleted
+		for e, n := range d.ByExt {
+			by[e] += n
+		}
+		if started {
+			win = append(win, commit{Hash: d.Hash, Author: d.Author, Subject: d.Subject, AI: d.AI, T: t,
+				Total: total, Added: d.Added, Deleted: d.Deleted, ByExt: maps.Clone(by)})
+		}
+	}
+	if len(win) == 0 {
+		return history{Head: led.Head}
+	}
+
+	off, offExt := 0, map[string]int{}
+	relative := func() {
+		off = -base0
+		for e, n := range base0By {
+			offExt[e] = -n
+		}
+	}
+	switch {
+	case o.author != "":
+		relative() // one person's contribution: count from the start of the window
+	case led.All:
+		// the ledger starts at the first commit, so the sums are real file sizes already
+	default:
+		// the ledger starts mid-history: anchor its end to the actual line counts at HEAD
+		abs, absBy, err := loadBaseline(o, led.Head)
+		if err != nil {
+			relative()
+			break
+		}
+		off = max(0, abs-total)
+		for e, n := range absBy {
+			offExt[e] = max(0, n-by[e])
+		}
+	}
+	for i := range win {
+		win[i].Total += off
+		for e, d := range offExt {
+			win[i].ByExt[e] += d
+		}
+	}
+	return history{Head: led.Head, Commits: win}
 }
 
 // --- cache ---
@@ -220,19 +391,19 @@ func cachePath(o opts) string {
 	return filepath.Join(d, "slopmeter", o.key()+".gob")
 }
 
-func readCache(o opts) (h history) {
+func readCache(o opts) (l ledger) {
 	f, err := os.Open(cachePath(o))
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	if gob.NewDecoder(f).Decode(&h) != nil {
-		return history{}
+	if gob.NewDecoder(f).Decode(&l) != nil {
+		return ledger{}
 	}
 	return
 }
 
-func writeCache(o opts, h history) {
+func writeCache(o opts, l ledger) {
 	p := cachePath(o)
 	if p == "" || os.MkdirAll(filepath.Dir(p), 0o755) != nil {
 		return
@@ -242,7 +413,7 @@ func writeCache(o opts, h history) {
 	if err != nil {
 		return
 	}
-	err = gob.NewEncoder(f).Encode(h)
+	err = gob.NewEncoder(f).Encode(l)
 	f.Close()
 	if err != nil {
 		os.Remove(tmp)
@@ -251,19 +422,23 @@ func writeCache(o opts, h history) {
 	os.Rename(tmp, p)
 }
 
-// loadCached reads new commits on top of prev (or the on-disk cache) and saves the result.
-// force ignores both and rebuilds from scratch.
-func loadCached(o opts, prev history, force bool) (history, error) {
+// loadCached syncs the ledger (starting from led, or the on-disk cache if led is empty),
+// saves it when it grew, and derives the history for o.since. force rebuilds from scratch.
+func loadCached(o opts, led ledger, force bool) (history, ledger, error) {
 	if force {
-		prev = history{}
-	} else if prev.Head == "" {
-		prev = readCache(o)
+		led = ledger{}
+	} else if led.Head == "" {
+		led = readCache(o)
 	}
-	h, err := loadHistory(o, prev)
-	if err == nil && h.Head != prev.Head {
-		writeCache(o, h)
+	before := led
+	led, err := syncLedger(o, led, o.since)
+	if err != nil {
+		return history{}, led, err
 	}
-	return h, err
+	if led.Head != before.Head || !led.From.Equal(before.From) || led.All != before.All || len(led.Deltas) != len(before.Deltas) {
+		writeCache(o, led)
+	}
+	return derive(o, led, o.since), led, nil
 }
 
 // --- live working tree ---
