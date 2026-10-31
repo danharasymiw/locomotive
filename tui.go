@@ -135,8 +135,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "tab":
 			m.view = (m.view + 1) % numViews
+		case "shift+tab":
+			m.view = (m.view + numViews - 1) % numViews
 		case "m":
 			m.mode = (m.mode + 1) % numModes
+		case "M":
+			m.mode = (m.mode + numModes - 1) % numModes
 		case "left", "h":
 			m.moveCursor(-1)
 		case "right", "l":
@@ -152,12 +156,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.live = nil
 			return m, m.loadHist(true)
-		case "p":
-			next := 0
+		case "p", "P":
+			step, cur := 1, -1
+			if msg.String() == "P" {
+				step = -1
+			}
 			for i, p := range periods {
 				if p.label == m.label {
-					next = (i + 1) % len(periods)
+					cur = i
 				}
+			}
+			next := (cur + step + len(periods)) % len(periods)
+			if cur < 0 { // custom --since date: start from either end
+				next = max(0, (1-step)/2*(len(periods)-1))
 			}
 			m.o.since, m.label, _ = resolveSince(periods[next].label)
 			m.hist, m.loaded, m.cur, m.followLast, m.live = history{}, false, 0, true, nil
@@ -229,7 +240,7 @@ func (m model) seriesFor() []series {
 	cs := m.hist.Commits
 	switch m.mode {
 	case modeLang:
-		return append([]series{whiteTotal(cs)}, languageSeries(cs, 5)...)
+		return languageSeries(cs, 5)
 	case modeChurn:
 		return churnSeries(cs)
 	case modeAuthors:
@@ -285,6 +296,9 @@ func (m model) header() string {
 		s += bold.Render("no commits in " + m.label) // base is unknown without any commit in the window
 	}
 	s += dim.Render(fmt.Sprintf("  %d commits  ", len(m.hist.Commits)))
+	if d := max(m.hist.Drift, -m.hist.Drift); d > max(1000, int(m.base())/100) {
+		s += red.Render(fmt.Sprintf("⚠ sum is off by %s vs real size  ", commas(m.hist.Drift)))
+	}
 	s += green.Render(fmt.Sprintf("+%s", commas(m.stat.added+m.stat.untracked))) + " " + red.Render(fmt.Sprintf("-%s", commas(m.stat.deleted)))
 	s += dim.Render(" uncommitted")
 	if len(m.live) > 0 {
@@ -390,6 +404,6 @@ func (m model) View() string {
 	default:
 		body, _ = m.draw()
 	}
-	help := axisStyle.Render("tab view · m mode · p period · ←/→ cursor (shift ×10) · r reload · q quit")
+	help := axisStyle.Render("tab view · m mode · p period (shift reverses) · ←/→ cursor (shift ×10) · r reload · q quit")
 	return strings.Join([]string{m.header(), tabs, "", body, m.info(), help}, "\n")
 }

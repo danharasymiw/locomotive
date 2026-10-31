@@ -35,6 +35,12 @@ var excludes = exclude(
 	"**/*.min.js", "**/*.min.css", "**/*.map", "**/*.pb.go", "**/*.pb.gw.go", "**/*.pb.cc",
 	"**/*.pb.h", "**/*_pb2.py", "**/*_pb2_grpc.py", "**/*.g.dart", "**/*.freezed.dart",
 	"**/*.designer.cs", "**/*.generated.*", "**/zz_generated*",
+	// documents, media, fonts and archives: git can read these as text and miscount them
+	"**/*.pdf", "**/*.doc", "**/*.docx", "**/*.xls", "**/*.xlsx", "**/*.ppt", "**/*.pptx",
+	"**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.ico", "**/*.webp", "**/*.svg",
+	"**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.otf", "**/*.eot",
+	"**/*.zip", "**/*.gz", "**/*.tgz", "**/*.tar", "**/*.jar", "**/*.whl",
+	"**/*.parquet", "**/*.pkl", "**/*.sqlite", "**/*.db",
 )
 
 func exclude(globs ...string) []string {
@@ -133,7 +139,7 @@ func (o opts) key() string {
 		exts = append(exts, e)
 	}
 	sort.Strings(exts)
-	parts := []string{abs, o.rev(), o.author, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v4"}
+	parts := []string{abs, o.rev(), o.author, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v5"}
 	sum := sha1.Sum([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:8])
 }
@@ -198,6 +204,10 @@ type commit struct {
 type history struct {
 	Head    string
 	Commits []commit
+	// Drift is real file size minus the summed commit deltas, known only when the whole history
+	// is loaded. Non-zero means some change never showed up in a commit's own diff (typically
+	// content added or removed inside a merge commit).
+	Drift int
 }
 
 // delta is one commit's effect on line counts, independent of any window.
@@ -323,6 +333,7 @@ func derive(o opts, led ledger, since time.Time) history {
 		by      = map[string]int{}
 		base0   int
 		base0By map[string]int
+		drift   int
 		started bool
 		prevT   time.Time
 	)
@@ -359,7 +370,10 @@ func derive(o opts, led ledger, since time.Time) history {
 	case o.author != "":
 		relative() // one person's contribution: count from the start of the window
 	case led.All:
-		// the ledger starts at the first commit, so the sums are real file sizes already
+		// the ledger starts at the first commit, so the sums should be real file sizes already
+		if abs, _, err := loadBaseline(o, led.Head); err == nil {
+			drift = abs - total
+		}
 	default:
 		// the ledger starts mid-history: anchor its end to the actual line counts at HEAD
 		abs, absBy, err := loadBaseline(o, led.Head)
@@ -378,7 +392,7 @@ func derive(o opts, led ledger, since time.Time) history {
 			win[i].ByExt[e] += d
 		}
 	}
-	return history{Head: led.Head, Commits: win}
+	return history{Head: led.Head, Commits: win, Drift: drift}
 }
 
 // --- cache ---
