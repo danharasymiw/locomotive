@@ -1,4 +1,4 @@
-// slopmeter plots a repo's lines of code over time: per commit, plus a live view
+// LoComotive plots a repo's lines of code over time: per commit, plus a live view
 // of uncommitted changes in the working tree.
 package main
 
@@ -18,7 +18,7 @@ func main() {
 	var (
 		o       opts
 		once    = flag.Bool("once", false, "print the chart once and exit")
-		modeArg = flag.String("mode", "total", "with -once: total, languages, churn, authors, ai or worktrees")
+		modeArg = flag.String("mode", "total", "with -once: total, languages, churn, authors, ai, who or worktrees")
 		asJSON  = flag.Bool("json", false, "print per-commit data as JSON and exit")
 		asCSV   = flag.Bool("csv", false, "print per-commit data as CSV and exit")
 		exts    = flag.String("ext", "", "only count these extensions, comma separated (e.g. go,ts)")
@@ -28,7 +28,7 @@ func main() {
 	flag.StringVar(&o.author, "author", "", "only count commits by this author (git --author pattern)")
 	sinceArg := flag.String("since", "", "history window: 1m, 3m, 6m, 1y, all, or a date like 2025-01-01 (default 3m)")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: slopmeter [flags] [repo-dir]")
+		fmt.Fprintln(os.Stderr, "usage: locomotive [flags] [repo-dir]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -86,11 +86,12 @@ func main() {
 		m.cur = max(0, len(h.Commits)-1)
 		m.stat, _ = loadLive(o)
 		for i := range numModes {
-			if s := i.String(); s == *modeArg || (i == modeAI && *modeArg == "ai") {
+			if s := i.String(); s == *modeArg || (i == modeAI && *modeArg == "ai") || (i == modeWho && *modeArg == "who") {
 				m.mode = i
 			}
 		}
 		body, _ := m.draw()
+		fmt.Println(brand)
 		fmt.Println(m.header())
 		fmt.Println(body)
 		fmt.Println(m.info())
@@ -111,7 +112,7 @@ func splitList(s string) (out []string) {
 }
 
 func fatal(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
+	fmt.Fprintln(os.Stderr, "derailed: "+msg)
 	os.Exit(1)
 }
 

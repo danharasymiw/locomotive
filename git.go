@@ -1,27 +1,29 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"encoding/gob"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxFileSize = 1 << 20
 
 // Noise that would swamp the real code size.
-var excludes = exclude(
+var excludeGlobs = []string{
 	// lockfiles (*.lock covers Cargo, yarn, Gemfile, poetry, Pipfile, composer, pub, mix, Podfile)
 	"**/*.lock", "**/go.sum", "**/go.work.sum", "**/package-lock.json", "**/npm-shrinkwrap.json",
 	"**/pnpm-lock.yaml", "**/packages.lock.json", "**/gradle.lockfile",
@@ -41,7 +43,9 @@ var excludes = exclude(
 	"**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.otf", "**/*.eot",
 	"**/*.zip", "**/*.gz", "**/*.tgz", "**/*.tar", "**/*.jar", "**/*.whl",
 	"**/*.parquet", "**/*.pkl", "**/*.sqlite", "**/*.db",
-)
+}
+
+var excludes = exclude(excludeGlobs...)
 
 func exclude(globs ...string) []string {
 	ps := make([]string, len(globs))
@@ -119,8 +123,50 @@ func loadBaseline(o opts, rev string) (int, map[string]int, error) {
 	return total, by, nil
 }
 
+// attrExcludes drops paths the repo marks in .gitattributes as generated or vendored. Git reads
+// the current attributes, so a path marked today is excluded from every commit of its history.
+var attrExcludes = []string{
+	":(exclude,attr:linguist-generated)", ":(exclude,attr:linguist-generated=true)",
+	":(exclude,attr:linguist-vendored)", ":(exclude,attr:linguist-vendored=true)",
+}
+
+var (
+	attrMu    sync.Mutex
+	attrRules = map[string]bool{}
+)
+
+// usesAttrRules reports whether the repo declares any linguist attribute. The attr: pathspecs
+// make every git log noticeably slower, so repos without such rules skip them.
+func usesAttrRules(dir string) bool {
+	attrMu.Lock()
+	defer attrMu.Unlock()
+	if v, ok := attrRules[dir]; ok {
+		return v
+	}
+	_, err := git(dir, "grep", "--untracked", "-q", "-e", "linguist-", "--", ":(glob)**/.gitattributes")
+	var ee *exec.ExitError
+	found := !(errors.As(err, &ee) && ee.ExitCode() == 1) // exit 1 is "no match"; any other failure keeps the exclusions
+	if !found {
+		if p, err := git(dir, "rev-parse", "--git-path", "info/attributes"); err == nil {
+			path := strings.TrimSpace(string(p))
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(dir, path)
+			}
+			if b, err := os.ReadFile(path); err == nil && bytes.Contains(b, []byte("linguist-")) {
+				found = true
+			}
+		}
+	}
+	attrRules[dir] = found
+	return found
+}
+
 func (o opts) pathspec() []string {
-	return append(append([]string{"--", "."}, excludes...), exclude(o.exclude...)...)
+	ps := append([]string{"--", "."}, excludes...)
+	if usesAttrRules(o.dir) {
+		ps = append(ps, attrExcludes...)
+	}
+	return append(ps, exclude(o.exclude...)...)
 }
 
 func (o opts) rev() string {
@@ -139,7 +185,7 @@ func (o opts) key() string {
 		exts = append(exts, e)
 	}
 	sort.Strings(exts)
-	parts := []string{abs, o.rev(), o.author, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v5"}
+	parts := []string{abs, o.rev(), o.author, strings.Join(exts, ","), strings.Join(o.exclude, ","), "v6"}
 	sum := sha1.Sum([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:8])
 }
@@ -189,12 +235,30 @@ func parseNumstat(line string) (added, deleted int, path string, ok bool) {
 
 var aiName = regexp.MustCompile(`(?i)claude|anthropic|copilot|cursor|aider|codex|gemini|openai|chatgpt|devin|windsurf`)
 
-// aiTrailer reports whether any Co-Authored-By value names a known coding agent.
-func aiTrailer(trailers string) bool { return aiName.MatchString(trailers) }
+// aiMessage matches the footers coding agents write into a commit message body.
+var aiMessage = regexp.MustCompile(`(?i)generated with.*(claude|cursor|copilot|codex|gemini|windsurf)|made with cursor|🤖|cursoragent`)
+
+// detectVersion invalidates cached ledgers whenever the AI heuristics change.
+const detectVersion = 4
+
+// botName matches automation accounts such as dependabot[bot] or renovate-bot.
+var botName = regexp.MustCompile(`(?i)\[bot\]|[-_ ]bot$|^bot[-_ ]`)
+
+// aiIdentity reports whether a name, email or trailer value names a known coding agent.
+func aiIdentity(fields ...string) bool {
+	for _, f := range fields {
+		if aiName.MatchString(f) {
+			return true
+		}
+	}
+	return false
+}
 
 type commit struct {
 	Hash, Author, Subject string
-	AI                    bool // a Co-Authored-By trailer names a coding agent
+	AI                    bool // a trailer, footer or identity names a coding agent
+	Bot                   bool // authored by an automation account
+	Agent                 bool // authored by a coding agent with no human co-author to credit
 	T                     time.Time
 	Total, Added, Deleted int
 	ByExt                 map[string]int
@@ -204,16 +268,12 @@ type commit struct {
 type history struct {
 	Head    string
 	Commits []commit
-	// Drift is real file size minus the summed commit deltas, known only when the whole history
-	// is loaded. Non-zero means some change never showed up in a commit's own diff (typically
-	// content added or removed inside a merge commit).
-	Drift int
 }
 
 // delta is one commit's effect on line counts, independent of any window.
 type delta struct {
 	Hash, Author, Subject string
-	AI                    bool
+	AI, Bot, Agent        bool
 	T                     time.Time
 	Added, Deleted        int
 	ByExt                 map[string]int // net lines per extension
@@ -226,50 +286,296 @@ type ledger struct {
 	From   time.Time
 	All    bool
 	Deltas []delta // oldest first
+	Detect int     // detectVersion the AI flags were computed with
 }
 
 func gitDate(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z") }
 
-// fetchDeltas reads commits oldest first. args select them (date limits and a rev or range).
-func fetchDeltas(o opts, args ...string) ([]delta, error) {
-	full := []string{"log", "--reverse", "--no-merges", "-M", "--numstat",
-		"--format=@%H%x09%ct%x09%aN%x09%(trailers:key=Co-Authored-By,valueonly,unfold,separator=%x1F)%x09%s"}
-	if o.author != "" {
-		full = append(full, "--author="+o.author)
+const (
+	recStart = "\x01" // starts a commit record in the log output
+	recEnd   = "\x02" // ends its header; numstat lines follow
+	fieldSep = "\x1e"
+)
+
+// globRegexp turns a git "glob" pathspec ("**/" any depth, "/**" everything below, "*" within one
+// path segment) into a regular expression source.
+func globRegexp(g string) string {
+	var b strings.Builder
+	for i := 0; i < len(g); {
+		switch {
+		case strings.HasPrefix(g[i:], "**/"):
+			b.WriteString(`(?:.*/)?`)
+			i += 3
+		case strings.HasPrefix(g[i:], "/**"):
+			b.WriteString(`/.*`)
+			i += 3
+		case strings.HasPrefix(g[i:], "**"):
+			b.WriteString(`.*`)
+			i += 2
+		case g[i] == '*':
+			b.WriteString(`[^/]*`)
+			i++
+		case g[i] == '?':
+			b.WriteString(`[^/]`)
+			i++
+		default:
+			b.WriteString(regexp.QuoteMeta(string(g[i])))
+			i++
+		}
 	}
-	out, err := git(o.dir, append(append(full, args...), o.pathspec()...)...)
+	return b.String()
+}
+
+// pathFilter decides which paths never count: the built-in and user globs, then paths the repo
+// marks generated or vendored. Doing this in Go rather than as git pathspecs is far faster,
+// because git re-evaluates every pathspec for every file of every commit.
+type pathFilter struct {
+	dir   string
+	re    *regexp.Regexp
+	attrs bool
+	mu    sync.Mutex
+	memo  map[string]bool
+}
+
+func newPathFilter(o opts) *pathFilter {
+	parts := make([]string, 0, len(excludeGlobs)+len(o.exclude))
+	for _, g := range append(append([]string{}, excludeGlobs...), o.exclude...) {
+		parts = append(parts, globRegexp(g))
+	}
+	return &pathFilter{dir: o.dir, re: regexp.MustCompile("^(?:" + strings.Join(parts, "|") + ")$"),
+		attrs: usesAttrRules(o.dir), memo: map[string]bool{}}
+}
+
+// prime classifies every path not seen before, asking git about attributes in one batch.
+func (f *pathFilter) prime(paths []string) {
+	f.mu.Lock()
+	var todo []string
+	for _, p := range paths {
+		if _, ok := f.memo[p]; ok {
+			continue
+		}
+		if f.re.MatchString(p) {
+			f.memo[p] = true
+		} else {
+			f.memo[p] = false
+			todo = append(todo, p)
+		}
+	}
+	f.mu.Unlock()
+	if !f.attrs || len(todo) == 0 {
+		return
+	}
+	cmd := exec.Command("git", "-C", f.dir, "check-attr", "-z", "--stdin", "linguist-generated", "linguist-vendored")
+	cmd.Stdin = strings.NewReader(strings.Join(todo, "\x00") + "\x00")
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fields := strings.Split(string(out), "\x00")
+	for i := 0; i+2 < len(fields); i += 3 {
+		if v := fields[i+2]; v == "set" || v == "true" {
+			f.memo[fields[i]] = true
+		}
+	}
+}
+
+func (f *pathFilter) excluded(p string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.memo[p]
+}
+
+var renameBoth = regexp.MustCompile(`\{([^}]*) => ([^}]*)\}`)
+
+// splitRename returns the old and new path of a numstat entry; both are the path for a plain edit.
+func splitRename(path string) (oldP, newP string) {
+	if !strings.Contains(path, " => ") {
+		return path, path
+	}
+	if renameBoth.MatchString(path) {
+		clean := func(s string) string { return strings.ReplaceAll(s, "//", "/") }
+		return clean(renameBoth.ReplaceAllString(path, "$1")), clean(renameBoth.ReplaceAllString(path, "$2"))
+	}
+	a, b, _ := strings.Cut(path, " => ")
+	return a, b
+}
+
+type fileStat struct {
+	added, deleted int
+	path           string
+	binary         bool
+}
+
+type rawCommit struct {
+	d     delta
+	files []fileStat
+}
+
+// fetchDeltas reads commits oldest first. args select them (date limits and a rev or range).
+// The commit list comes from one cheap rev-list, then is split into chunks that git log reads
+// in parallel: log is single-threaded and the per-commit diffs dominate the load time.
+func fetchDeltas(o opts, args ...string) ([]delta, error) {
+	list := append([]string{"rev-list", "--reverse", "--no-merges"}, args...)
+	if o.author != "" {
+		list = append(list, "--author="+o.author)
+	}
+	out, err := git(o.dir, list...)
 	if err != nil {
 		return nil, err
 	}
-	var (
-		ds  []delta
-		cur *delta
-	)
-	flush := func() {
-		if cur != nil {
-			ds = append(ds, *cur)
-		}
+	hashes := strings.Fields(string(out))
+	if len(hashes) == 0 {
+		return nil, nil
 	}
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case strings.HasPrefix(line, "@"):
-			flush()
-			f := append(strings.SplitN(line[1:], "\t", 5), "", "", "", "", "")
-			secs, _ := strconv.ParseInt(f[1], 10, 64)
-			cur = &delta{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], AI: aiTrailer(f[3]), Subject: f[4], ByExt: map[string]int{}}
-		case line != "" && cur != nil:
-			if a, d, p, ok := parseNumstat(line); ok && o.wants(p) {
-				cur.Added += a
-				cur.Deleted += d
-				cur.ByExt[extOf(p)] += a - d
+	f := newPathFilter(o)
+	n := max(1, min(runtime.NumCPU(), 8, len(hashes)/150))
+	size := (len(hashes) + n - 1) / n
+	parts := make([][]delta, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		chunk := hashes[i*size : min(len(hashes), (i+1)*size)]
+		if len(chunk) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			parts[i], errs[i] = logChunk(o, f, chunk)
+		}()
+	}
+	wg.Wait()
+	var ds []delta
+	for i := range n {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		ds = append(ds, parts[i]...)
+	}
+	return ds, nil
+}
+
+// readLog runs git log over exactly the given commits, in order, and parses the records.
+func readLog(o opts, hashes []string, renames bool) ([]rawCommit, error) {
+	format := "--format=" + recStart + strings.Join([]string{"%H", "%ct", "%aN", "%aE", "%cN", "%cE",
+		"%(trailers:valueonly,unfold,separator=%x1F)", "%(trailers:key=Co-authored-by,valueonly,unfold,separator=%x1F)", "%s", "%b"}, fieldSep) + recEnd
+	rn := "-M"
+	if !renames {
+		rn = "--no-renames"
+	}
+	cmd := exec.Command("git", "-C", o.dir, "-c", "core.quotepath=off", "log", "--no-walk=unsorted", "--stdin",
+		"--no-merges", rn, "--numstat", format, "--", ".")
+	cmd.Stdin = strings.NewReader(strings.Join(hashes, "\n") + "\n")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, fmt.Errorf("git log: %s", msg)
+		}
+		return nil, err
+	}
+	var rs []rawCommit
+	for _, rec := range strings.Split(string(out), recStart)[1:] {
+		head, rest, _ := strings.Cut(rec, recEnd)
+		f := append(strings.SplitN(head, fieldSep, 10), "", "", "", "", "", "", "", "", "", "")
+		secs, _ := strconv.ParseInt(f[1], 10, 64)
+		d := delta{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], Subject: f[8], Bot: botName.MatchString(f[2]), ByExt: map[string]int{}}
+		d.AI = aiIdentity(f[2], f[3], f[4], f[5], f[6]) || aiMessage.MatchString(f[8]+"\n"+f[9])
+		if aiIdentity(f[2], f[3]) {
+			// an agent authored it: credit the person who launched it, named in a Co-authored-by trailer
+			d.Agent = true
+			for _, v := range strings.Split(f[7], "\x1f") {
+				if name := strings.TrimSpace(strings.SplitN(v, "<", 2)[0]); name != "" && !aiIdentity(v) {
+					d.Author, d.Agent = name, false
+					break
+				}
 			}
 		}
+		rc := rawCommit{d: d}
+		for _, line := range strings.Split(rest, "\n") {
+			if a, del, p, ok := parseNumstat(line); ok {
+				rc.files = append(rc.files, fileStat{added: a, deleted: del, path: p})
+			} else if fs := strings.SplitN(line, "\t", 3); len(fs) == 3 && fs[0] == "-" && fs[1] == "-" {
+				rc.files = append(rc.files, fileStat{path: fs[2], binary: true}) // binary: no lines, but the commit touched it
+			}
+		}
+		rs = append(rs, rc)
 	}
-	flush()
-	return ds, sc.Err()
+	return rs, nil
+}
+
+// logChunk reads the given commits and counts the lines of the files that pass the filter.
+// A rename between an excluded and an included path is re-read without rename detection, so the
+// included side counts in full, exactly as if the excluded side did not exist.
+func logChunk(o opts, f *pathFilter, hashes []string) ([]delta, error) {
+	raws, err := readLog(o, hashes, true)
+	if err != nil {
+		return nil, err
+	}
+	primeAll := func(rs []rawCommit) {
+		var paths []string
+		for _, rc := range rs {
+			for _, fs := range rc.files {
+				a, b := splitRename(fs.path)
+				paths = append(paths, a, b)
+			}
+		}
+		f.prime(paths)
+	}
+	primeAll(raws)
+	crossing := func(rc rawCommit) bool {
+		for _, fs := range rc.files {
+			if a, b := splitRename(fs.path); a != b && f.excluded(a) != f.excluded(b) {
+				return true
+			}
+		}
+		return false
+	}
+	var redo []string
+	for _, rc := range raws {
+		if crossing(rc) {
+			redo = append(redo, rc.d.Hash)
+		}
+	}
+	fixed := map[string]rawCommit{}
+	if len(redo) > 0 {
+		again, err := readLog(o, redo, false)
+		if err != nil {
+			return nil, err
+		}
+		primeAll(again)
+		for _, rc := range again {
+			fixed[rc.d.Hash] = rc
+		}
+	}
+	ds := make([]delta, 0, len(raws))
+	for _, rc := range raws {
+		if fx, ok := fixed[rc.d.Hash]; ok {
+			rc = fx
+		}
+		d := rc.d
+		kept := false // the commit touches at least one path that is not excluded
+		for _, fs := range rc.files {
+			_, newP := splitRename(fs.path)
+			if f.excluded(newP) {
+				continue
+			}
+			kept = true
+			if fs.binary || !o.wants(fs.path) {
+				continue
+			}
+			d.Added += fs.added
+			d.Deleted += fs.deleted
+			d.ByExt[extOf(fs.path)] += fs.added - fs.deleted
+		}
+		if kept {
+			ds = append(ds, d)
+		}
+	}
+	return ds, nil
 }
 
 // syncLedger brings led up to date: new commits on top, and older ones if since reaches
@@ -333,7 +639,6 @@ func derive(o opts, led ledger, since time.Time) history {
 		by      = map[string]int{}
 		base0   int
 		base0By map[string]int
-		drift   int
 		started bool
 		prevT   time.Time
 	)
@@ -351,7 +656,7 @@ func derive(o opts, led ledger, since time.Time) history {
 			by[e] += n
 		}
 		if started {
-			win = append(win, commit{Hash: d.Hash, Author: d.Author, Subject: d.Subject, AI: d.AI, T: t,
+			win = append(win, commit{Hash: d.Hash, Author: d.Author, Subject: d.Subject, AI: d.AI, Bot: d.Bot, Agent: d.Agent, T: t,
 				Total: total, Added: d.Added, Deleted: d.Deleted, ByExt: maps.Clone(by)})
 		}
 	}
@@ -370,10 +675,7 @@ func derive(o opts, led ledger, since time.Time) history {
 	case o.author != "":
 		relative() // one person's contribution: count from the start of the window
 	case led.All:
-		// the ledger starts at the first commit, so the sums should be real file sizes already
-		if abs, _, err := loadBaseline(o, led.Head); err == nil {
-			drift = abs - total
-		}
+		// the ledger starts at the first commit, so the sums are the file sizes as far as commits can tell
 	default:
 		// the ledger starts mid-history: anchor its end to the actual line counts at HEAD
 		abs, absBy, err := loadBaseline(o, led.Head)
@@ -392,7 +694,7 @@ func derive(o opts, led ledger, since time.Time) history {
 			win[i].ByExt[e] += d
 		}
 	}
-	return history{Head: led.Head, Commits: win, Drift: drift}
+	return history{Head: led.Head, Commits: win}
 }
 
 // --- cache ---
@@ -402,7 +704,7 @@ func cachePath(o opts) string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(d, "slopmeter", o.key()+".gob")
+	return filepath.Join(d, "locomotive", o.key()+".gob")
 }
 
 func readCache(o opts) (l ledger) {
@@ -411,7 +713,7 @@ func readCache(o opts) (l ledger) {
 		return
 	}
 	defer f.Close()
-	if gob.NewDecoder(f).Decode(&l) != nil {
+	if gob.NewDecoder(f).Decode(&l) != nil || l.Detect != detectVersion {
 		return ledger{}
 	}
 	return
@@ -422,6 +724,7 @@ func writeCache(o opts, l ledger) {
 	if p == "" || os.MkdirAll(filepath.Dir(p), 0o755) != nil {
 		return
 	}
+	l.Detect = detectVersion
 	tmp := p + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {

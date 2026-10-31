@@ -1,4 +1,4 @@
-module github.com/danharasymiw/slopmeter
+module github.com/danharasymiw/locomotive
 
 go 1.25.1
 

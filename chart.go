@@ -46,6 +46,7 @@ func (g geom) timeAt(x int) (time.Time, bool) {
 
 // render draws all series on one time axis. cursor, when non-nil, highlights that column.
 func render(w, h int, ss []series, live bool, cursor *time.Time) (string, geom) {
+	ss = thin(ss, w*4)
 	if len(ss) == 0 || len(ss[0].pts) < 2 {
 		return "not enough data yet…", geom{}
 	}
@@ -152,7 +153,9 @@ func languageSeries(cs []commit, top int) []series {
 		ss = append(ss, series{name: e, color: palette[i%len(palette)]})
 	}
 	other := series{name: "other", color: palette[len(palette)-1]}
-	for _, c := range cs {
+	step := max(1, len(cs)/maxPoints) // each commit is a cumulative snapshot, so sampling loses nothing
+	for i := len(cs) - 1; i >= 0; i -= step {
+		c := cs[i]
 		rest := 0
 		for e, n := range c.ByExt {
 			if !isKept[e] {
@@ -164,24 +167,32 @@ func languageSeries(cs []commit, top int) []series {
 		}
 		other.pts = append(other.pts, point{c.T, float64(rest)})
 	}
+	reverse := func(p []point) {
+		for i, j := 0, len(p)-1; i < j; i, j = i+1, j-1 {
+			p[i], p[j] = p[j], p[i]
+		}
+	}
+	for i := range ss {
+		reverse(ss[i].pts) // sampled newest to oldest so the last commit is always included
+	}
+	reverse(other.pts)
 	if len(exts) > top {
 		ss = append(ss, other)
 	}
 	return ss
 }
 
-// whiteTotal is the total line drawn over breakdown views (palette already uses the default blue).
-func whiteTotal(cs []commit) series {
-	t := totalSeries(cs)[0]
-	t.color = lipgloss.Color("255")
-	return t
-}
+// maxPoints bounds how many commits a snapshot-based series samples.
+const maxPoints = 4000
 
 func authorKey(c commit) string { return c.Author }
 
 func aiKey(c commit) string {
-	if c.AI {
+	switch {
+	case c.AI:
 		return "ai-assisted"
+	case c.Bot:
+		return "bot"
 	}
 	return "human"
 }
@@ -212,13 +223,12 @@ func groupSeries(cs []commit, key func(commit) string, top int) []series {
 	}
 	other := series{name: "other", color: palette[len(palette)-1]}
 	run := map[string]int{}
+	rest := 0
 	for _, c := range cs {
-		run[key(c)] += c.Added - c.Deleted
-		rest := 0
-		for n, v := range run {
-			if !isKept[n] {
-				rest += v
-			}
+		k, d := key(c), c.Added-c.Deleted
+		run[k] += d
+		if !isKept[k] {
+			rest += d
 		}
 		for i, n := range keep {
 			ss[i].pts = append(ss[i].pts, point{c.T, float64(run[n])})
@@ -261,4 +271,93 @@ func commas(n int) string {
 		return "-" + s
 	}
 	return s
+}
+
+// whoLines returns each person's lines added in AI-assisted commits through commit index upto.
+// Bot accounts are left out, since they are not people choosing to use AI.
+func whoLines(cs []commit, upto int) map[string]int {
+	out := map[string]int{}
+	for _, c := range cs[:min(upto+1, len(cs))] {
+		if !c.Bot && !c.Agent {
+			out[c.Author] += map[bool]int{true: c.Added}[c.AI]
+		}
+	}
+	return out
+}
+
+// whoSeries plots, per person, the running lines added in AI-assisted commits, ranking people
+// by their AI lines.
+func whoSeries(cs []commit, top int) []series {
+	total := whoLines(cs, len(cs)-1)
+	names := make([]string, 0, len(total))
+	for n := range total {
+		names = append(names, n)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if total[names[i]] != total[names[j]] {
+			return total[names[i]] > total[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	names = names[:min(top, len(names))]
+	idx := map[string]int{}
+	ss := make([]series, len(names))
+	for i, n := range names {
+		idx[n] = i
+		ss[i] = series{name: n, color: palette[i%len(palette)]}
+	}
+	run := map[string]int{}
+	for _, c := range cs {
+		i, ok := idx[c.Author]
+		if !ok || c.Bot || c.Agent {
+			continue
+		}
+		if c.AI {
+			run[c.Author] += c.Added
+		}
+		ss[i].pts = append(ss[i].pts, point{c.T, float64(run[c.Author])})
+	}
+	return ss
+}
+
+// thin keeps long series drawable: past limit points it keeps each bucket's lowest and highest
+// point (in time order), so spikes survive while the chart does far less work.
+func thin(ss []series, limit int) []series {
+	out := make([]series, len(ss))
+	for i, s := range ss {
+		out[i] = s
+		n := len(s.pts)
+		if n <= limit || limit < 4 {
+			continue
+		}
+		buckets := limit / 2
+		pts := make([]point, 0, limit)
+		for b := 0; b < buckets; b++ {
+			seg := s.pts[b*n/buckets : (b+1)*n/buckets]
+			if len(seg) == 0 {
+				continue
+			}
+			lo, hi := 0, 0
+			for j, p := range seg {
+				if p.v < seg[lo].v {
+					lo = j
+				}
+				if p.v > seg[hi].v {
+					hi = j
+				}
+			}
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			pts = append(pts, seg[lo])
+			if hi != lo {
+				pts = append(pts, seg[hi])
+			}
+		}
+		if last := s.pts[n-1]; pts[len(pts)-1] != last {
+			pts = append(pts, last)
+		}
+		out[i].pts = pts
+	}
+	return out
 }

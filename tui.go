@@ -24,12 +24,16 @@ const (
 	modeChurn
 	modeAuthors
 	modeAI
+	modeWho
 	numModes
 )
 
 func (m mode) String() string {
-	return [...]string{"total", "languages", "churn", "authors", "human vs ai"}[m]
+	return [...]string{"total", "languages", "churn", "authors", "human vs ai", "who uses ai"}[m]
 }
+
+// brand is the dim name tag shown next to the tabs and above -once output.
+var brand = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("LoComotive")
 
 type view int
 
@@ -56,6 +60,7 @@ type (
 		err error
 	}
 	tickMsg struct{}
+	dotsMsg struct{}
 )
 
 type model struct {
@@ -74,14 +79,19 @@ type model struct {
 	wtPts      map[string][]point // net uncommitted lines per worktree over time
 	mode       mode
 	w, h       int
+	frame      int // loading dots animation
+	sc         *seriesCache
+	dotsOn     bool // a dots tick is already scheduled; never run two chains
 	err        error
 }
 
 func newModel(o opts, label string) model {
-	return model{o: o, label: label, followLast: true, wtPts: map[string][]point{}}
+	return model{o: o, label: label, followLast: true, dotsOn: true, sc: &seriesCache{}, wtPts: map[string][]point{}}
 }
 
-func (m model) Init() tea.Cmd { return tea.Batch(m.loadHist(false), m.poll(), m.pollWT(), tick()) }
+func (m model) Init() tea.Cmd {
+	return tea.Batch(m.loadHist(false), m.poll(), m.pollWT(), tick(), dots())
+}
 
 func (m model) pollWT() tea.Cmd {
 	o := m.o
@@ -89,6 +99,10 @@ func (m model) pollWT() tea.Cmd {
 		s, err := pollWorktrees(o)
 		return wtMsg{s, err}
 	}
+}
+
+func dots() tea.Cmd {
+	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return dotsMsg{} })
 }
 
 func tick() tea.Cmd { return tea.Tick(pollEvery, func(time.Time) tea.Msg { return tickMsg{} }) }
@@ -172,7 +186,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.o.since, m.label, _ = resolveSince(periods[next].label)
 			m.hist, m.loaded, m.cur, m.followLast, m.live = history{}, false, 0, true, nil
-			return m, m.loadHist(false)
+			if m.dotsOn {
+				return m, m.loadHist(false)
+			}
+			m.dotsOn = true
+			return m, tea.Batch(m.loadHist(false), dots())
 		}
 	case tea.MouseMsg:
 		motion := msg.Action == tea.MouseActionMotion
@@ -200,6 +218,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cur = max(0, len(m.hist.Commits)-1)
 			}
 		}
+	case dotsMsg:
+		if m.loaded || m.err != nil {
+			m.dotsOn = false
+			break // the dots only move while commits load
+		}
+		m.frame++
+		return m, dots()
 	case tickMsg:
 		return m, tea.Batch(m.poll(), m.pollWT(), tick())
 	case wtMsg:
@@ -236,7 +261,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) chartH() int { return max(m.h-chromeH-4, 5) }
 
+// seriesCache keeps the series of the current mode and history: building them walks every commit,
+// and View runs on every key, tick and mouse move.
+type seriesCache struct {
+	mode  mode
+	n     int
+	head  string
+	since time.Time
+	ss    []series
+	ok    bool
+}
+
 func (m model) seriesFor() []series {
+	c := m.sc
+	if c != nil && c.ok && c.mode == m.mode && c.n == len(m.hist.Commits) && c.head == m.hist.Head && c.since.Equal(m.o.since) {
+		return c.ss
+	}
+	ss := m.buildSeries()
+	if c != nil {
+		*c = seriesCache{m.mode, len(m.hist.Commits), m.hist.Head, m.o.since, ss, true}
+	}
+	return ss
+}
+
+func (m model) buildSeries() []series {
 	cs := m.hist.Commits
 	switch m.mode {
 	case modeLang:
@@ -244,13 +292,15 @@ func (m model) seriesFor() []series {
 	case modeChurn:
 		return churnSeries(cs)
 	case modeAuthors:
-		return append([]series{whiteTotal(cs)}, groupSeries(cs, authorKey, 5)...)
+		return groupSeries(cs, authorKey, 5)
 	case modeAI:
-		ss := groupSeries(cs, aiKey, 2)
+		ss := groupSeries(cs, aiKey, 3)
 		for i := range ss {
-			ss[i].color = map[string]lipgloss.Color{"human": "39", "ai-assisted": "208"}[ss[i].name]
+			ss[i].color = map[string]lipgloss.Color{"human": "39", "ai-assisted": "208", "bot": "245"}[ss[i].name]
 		}
-		return append([]series{whiteTotal(cs)}, ss...)
+		return ss
+	case modeWho:
+		return whoSeries(cs, 5)
 	}
 	return totalSeries(cs)
 }
@@ -296,9 +346,6 @@ func (m model) header() string {
 		s += bold.Render("no commits in " + m.label) // base is unknown without any commit in the window
 	}
 	s += dim.Render(fmt.Sprintf("  %d commits  ", len(m.hist.Commits)))
-	if d := max(m.hist.Drift, -m.hist.Drift); d > max(1000, int(m.base())/100) {
-		s += red.Render(fmt.Sprintf("⚠ sum is off by %s vs real size  ", commas(m.hist.Drift)))
-	}
 	s += green.Render(fmt.Sprintf("+%s", commas(m.stat.added+m.stat.untracked))) + " " + red.Render(fmt.Sprintf("-%s", commas(m.stat.deleted)))
 	s += dim.Render(" uncommitted")
 	if len(m.live) > 0 {
@@ -355,6 +402,19 @@ func (m model) info() string {
 	case modeAI:
 		key = aiKey
 	}
+	if m.mode == modeWho {
+		sh := whoLines(m.hist.Commits, m.cur)
+		var names []string
+		for n := range sh {
+			names = append(names, n)
+		}
+		sort.Slice(names, func(i, j int) bool { return sh[names[i]] > sh[names[j]] })
+		var parts []string
+		for _, n := range names[:min(len(names), 6)] {
+			parts = append(parts, fmt.Sprintf("%s %s", n, commas(sh[n])))
+		}
+		s += "\n" + axisStyle.Render(strings.Join(parts, " · "))
+	}
 	if key != nil {
 		run := groupTotals(m.hist.Commits, m.cur, key)
 		var names []string
@@ -377,7 +437,7 @@ func (m model) info() string {
 
 func (m model) View() string {
 	if m.w == 0 {
-		return "loading…"
+		return "shoveling commits..."
 	}
 	on := lipgloss.NewStyle().Bold(true).Foreground(lineColor).Underline(true)
 	tab := func(name string, active bool) string {
@@ -392,18 +452,28 @@ func (m model) View() string {
 	}
 	tabs := tab(histLabel, m.view == viewHist) + "  " +
 		tab("live", m.view == viewLive) + "  " + tab("worktrees", m.view == viewWT)
+	if pad := m.w - lipgloss.Width(tabs) - lipgloss.Width(brand); pad >= 2 {
+		tabs += strings.Repeat(" ", pad) + brand
+	}
 
 	var body string
+	placeholder := true // a one-line message instead of a chart: pad it so the help bar stays at the bottom
 	switch {
 	case m.err != nil:
-		body = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render(m.err.Error())
+		body = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("derailed: " + m.err.Error())
 	case !m.loaded && m.view == viewHist:
-		body = "loading " + m.label + " of history…"
+		body = "shoveling commits" + fmt.Sprintf("%-3s", strings.Repeat(".", m.frame%3+1)) + " (" + m.label + " of history)"
 	case len(m.hist.Commits) == 0 && m.view == viewHist:
-		body = "no commits in the last " + m.label + " — press p for a longer window"
+		body = "empty station: no commits in the last " + m.label + ". Press p for a longer line"
 	default:
 		body, _ = m.draw()
+		placeholder = false
 	}
-	help := axisStyle.Render("tab view · m mode · p period (shift reverses) · ←/→ cursor (shift ×10) · r reload · q quit")
-	return strings.Join([]string{m.header(), tabs, "", body, m.info(), help}, "\n")
+	help := axisStyle.Render("tab view · m mode · p period · ←/→ cursor (shift ×10) · r reload · q quit")
+	header, info := m.header(), m.info()
+	if placeholder {
+		used := lipgloss.Height(header) + lipgloss.Height(tabs) + 1 + lipgloss.Height(body) + lipgloss.Height(info) + 1
+		body += strings.Repeat("\n", max(0, m.h-used))
+	}
+	return strings.Join([]string{header, tabs, "", body, info, help}, "\n")
 }
