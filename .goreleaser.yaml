@@ -1,6 +1,6 @@
 version: 2
 
-project_name: locomotive
+project_name: slopmeter
 
 builds:
   - main: .

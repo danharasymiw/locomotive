@@ -704,7 +704,7 @@ func cachePath(o opts) string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(d, "locomotive", o.key()+".gob")
+	return filepath.Join(d, "slopmeter", o.key()+".gob")
 }
 
 func readCache(o opts) (l ledger) {

@@ -1,33 +1,33 @@
-# LoComotive
+# slopmeter
 
-A terminal UI that charts a git repo's lines of code over time, per commit and live as you edit. Watch your lines roll in, and how much of the train is being driven by AI, especially when agents are writing the code.
+A terminal UI that charts a git repo's lines of code over time, per commit and live as you edit. Built to watch how much code (and how much slop) piles up, especially when agents are writing it.
 
-## All aboard
+## Install
 
 With Go:
 
 ```sh
-go install github.com/danharasymiw/locomotive@latest
+go install github.com/danharasymiw/slopmeter@latest
 ```
 
-Or grab a prebuilt binary from the [releases page](https://github.com/danharasymiw/locomotive/releases).
+Or grab a prebuilt binary from the [releases page](https://github.com/danharasymiw/slopmeter/releases).
 
 ## Use
 
 ```sh
 cd your-repo
-locomotive
+slopmeter
 ```
 
 `tab` cycles between three views:
 
 - **history** plots lines of code at every commit. `m` switches between *total*, *languages* (one line per extension, plus a total), *churn* (lines added vs deleted per commit), *authors* (running net lines per person, mailmap-aware), *human vs ai* and *who uses ai* (one line per person: their running lines added in AI-assisted commits, bots excluded). The AI split classifies a commit as AI-assisted when a trailer, a message footer (such as `Generated with Claude Code`) or the author or committer identity names a coding agent (Claude, Copilot, Cursor, Aider, Codex, Gemini and similar), so commits without any of those count as human. Commits by automation accounts (`dependabot[bot]`, `renovate-bot` and similar) form a separate *bot* group.
 - **live** plots your working tree (uncommitted changes plus untracked files) once a second.
-- **worktrees** plots net uncommitted lines for every worktree of the repo at once, one line per branch line. A worktree is tagged `[session]` when a `claude` process is running in it and `[agent]` when git has it locked, which is how Claude Code subagent worktrees appear.
+- **worktrees** plots net uncommitted lines for every worktree of the repo at once. A worktree is tagged `[session]` when a `claude` process is running in it and `[agent]` when git has it locked, which is how Claude Code subagent worktrees appear.
 
 In the history view, move the cursor with `←`/`→` (`shift` jumps 10 commits) or the mouse to see the commit behind each point. `p` cycles the history window (1m, 3m, 6m, 1y, all), `r` rebuilds from scratch, `q` quits.
 
-### Departures board
+### Screenshots
 
 Switch between them with `m`.
 
@@ -59,7 +59,7 @@ Switch between them with `m`.
 
 ![worktrees](docs/worktrees.svg)
 
-### Timetable
+### Flags
 
 | Flag | Meaning |
 | --- | --- |

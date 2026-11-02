@@ -33,7 +33,7 @@ func (m mode) String() string {
 }
 
 // brand is the dim name tag shown next to the tabs and above -once output.
-var brand = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("LoComotive")
+var brand = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("slopmeter")
 
 // withBrand right-aligns the brand tag on the first line of s, when there is room.
 func withBrand(s string, w int) string {
@@ -451,7 +451,7 @@ func (m model) info() string {
 
 func (m model) View() string {
 	if m.w == 0 {
-		return "shoveling commits..."
+		return "sifting through slop..."
 	}
 	on := lipgloss.NewStyle().Bold(true).Foreground(lineColor).Underline(true)
 	tab := func(name string, active bool) string {
@@ -474,11 +474,11 @@ func (m model) View() string {
 	placeholder := true // a one-line message instead of a chart: pad it so the help bar stays at the bottom
 	switch {
 	case m.err != nil:
-		body = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("derailed: " + m.err.Error())
+		body = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("spilled: " + m.err.Error())
 	case !m.loaded && m.view == viewHist:
-		body = "shoveling commits" + fmt.Sprintf("%-3s", strings.Repeat(".", m.frame%3+1)) + " (" + m.label + " of history)"
+		body = "sifting through slop" + fmt.Sprintf("%-3s", strings.Repeat(".", m.frame%3+1)) + " (" + m.label + " of history)"
 	case len(m.hist.Commits) == 0 && m.view == viewHist:
-		body = "empty station: no commits in the last " + m.label + ". Press p for a longer line"
+		body = "the trough is empty: no commits in the last " + m.label + ". Press p for a longer window"
 	default:
 		body, _ = m.draw()
 		placeholder = false

@@ -1,4 +1,4 @@
-// LoComotive plots a repo's lines of code over time: per commit, plus a live view
+// slopmeter plots a repo's lines of code over time: per commit, plus a live view
 // of uncommitted changes in the working tree.
 package main
 
@@ -28,7 +28,7 @@ func main() {
 	flag.StringVar(&o.author, "author", "", "only count commits by this author (git --author pattern)")
 	sinceArg := flag.String("since", "", "history window: 1m, 3m, 6m, 1y, all, or a date like 2025-01-01 (default 3m)")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: locomotive [flags] [repo-dir]")
+		fmt.Fprintln(os.Stderr, "usage: slopmeter [flags] [repo-dir]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -111,7 +111,7 @@ func splitList(s string) (out []string) {
 }
 
 func fatal(msg string) {
-	fmt.Fprintln(os.Stderr, "derailed: "+msg)
+	fmt.Fprintln(os.Stderr, "spilled: "+msg)
 	os.Exit(1)
 }
 

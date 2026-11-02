@@ -8,7 +8,7 @@
 <text x="318.4 326.8" y="30" fill="#00d787" xml:space="preserve">+0</text>
 <text x="343.6 352.0" y="30" fill="#ff5f5f" xml:space="preserve">-0</text>
 <text x="368.8 377.2 385.6 394.0 402.4 410.8 419.2 427.6 436.0 444.4 452.8" y="30" fill="#585858" xml:space="preserve">uncommitted</text>
-<text x="772.0 780.4 788.8 797.2 805.6 814.0 822.4 830.8 839.2 847.6" y="30" fill="#ffaf00" font-weight="bold" xml:space="preserve">LoComotive</text>
+<text x="780.4 788.8 797.2 805.6 814.0 822.4 830.8 839.2 847.6" y="30" fill="#ffaf00" font-weight="bold" xml:space="preserve">slopmeter</text>
 <text x="16.0 24.4 32.8 41.2 49.6" y="50" fill="#585858" xml:space="preserve">1782│</text>
 <text x="16.0 24.4 32.8 41.2 49.6" y="70" fill="#585858" xml:space="preserve">1688│</text>
 <text x="814.0 822.4 830.8" y="70" fill="#00afff" xml:space="preserve">⡠⠔⠊</text>
