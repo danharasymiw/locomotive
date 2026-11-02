@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,6 +78,9 @@ var periods = []struct {
 	months int // 0 = all history
 }{{"1m", 1}, {"3m", 3}, {"6m", 6}, {"1y", 12}, {"all", 0}}
 
+// cycle is what `p` steps through; --since still accepts the other labels in periods.
+var cycle = []string{"3m", "1y", "all"}
+
 // resolveSince turns a window label or a YYYY-MM-DD date into a start time (zero = all history).
 func resolveSince(s string) (time.Time, string, error) {
 	if s == "" {
@@ -99,14 +101,40 @@ func resolveSince(s string) (time.Time, string, error) {
 	return t, s, nil
 }
 
-// loadBaseline counts the lines in every tracked text file at rev, in total and per extension.
-func loadBaseline(o opts, rev string) (int, map[string]int, error) {
+type baseEntry struct {
+	once sync.Once
+	n    int
+	err  error
+}
+
+var (
+	baseMu   sync.Mutex
+	baseMemo = map[string]*baseEntry{}
+)
+
+// baselineAt is loadBaseline, remembered and shared: a commit's line count never changes, and the
+// staged load starts it early, alongside reading the newest commits, then derives with it.
+func baselineAt(o opts, rev string) (int, error) {
+	key := o.key() + "|" + rev
+	baseMu.Lock()
+	e := baseMemo[key]
+	if e == nil {
+		e = &baseEntry{}
+		baseMemo[key] = e
+	}
+	baseMu.Unlock()
+	e.once.Do(func() { e.n, e.err = loadBaseline(o, rev) })
+	return e.n, e.err
+}
+
+// loadBaseline counts the lines in every tracked text file at rev.
+func loadBaseline(o opts, rev string) (int, error) {
 	args := append([]string{"grep", "-I", "-c", "", rev}, o.pathspec()...)
 	out, err := git(o.dir, args...)
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	total, by := 0, map[string]int{}
+	total := 0
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimPrefix(line, rev+":")
 		i := strings.LastIndex(line, ":")
@@ -118,9 +146,8 @@ func loadBaseline(o opts, rev string) (int, map[string]int, error) {
 			continue
 		}
 		total += n
-		by[extOf(line[:i])] += n
 	}
-	return total, by, nil
+	return total, nil
 }
 
 // attrExcludes drops paths the repo marks in .gitattributes as generated or vendored. Git reads
@@ -239,7 +266,7 @@ var aiName = regexp.MustCompile(`(?i)claude|anthropic|copilot|cursor|aider|codex
 var aiMessage = regexp.MustCompile(`(?i)generated with.*(claude|cursor|copilot|codex|gemini|windsurf)|made with cursor|🤖|cursoragent`)
 
 // detectVersion invalidates cached ledgers whenever the AI heuristics change.
-const detectVersion = 4
+const detectVersion = 5
 
 // botName matches automation accounts such as dependabot[bot] or renovate-bot.
 var botName = regexp.MustCompile(`(?i)\[bot\]|[-_ ]bot$|^bot[-_ ]`)
@@ -261,7 +288,6 @@ type commit struct {
 	Agent                 bool // authored by a coding agent with no human co-author to credit
 	T                     time.Time
 	Total, Added, Deleted int
-	ByExt                 map[string]int
 }
 
 // history is what the UI plots: the commits inside the chosen window, with running totals.
@@ -276,7 +302,6 @@ type delta struct {
 	AI, Bot, Agent        bool
 	T                     time.Time
 	Added, Deleted        int
-	ByExt                 map[string]int // net lines per extension
 }
 
 // ledger is the cached commit log. It holds every commit reachable from Head with a commit time
@@ -482,7 +507,7 @@ func readLog(o opts, hashes []string, renames bool) ([]rawCommit, error) {
 		head, rest, _ := strings.Cut(rec, recEnd)
 		f := append(strings.SplitN(head, fieldSep, 10), "", "", "", "", "", "", "", "", "", "")
 		secs, _ := strconv.ParseInt(f[1], 10, 64)
-		d := delta{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], Subject: f[8], Bot: botName.MatchString(f[2]), ByExt: map[string]int{}}
+		d := delta{Hash: f[0], T: time.Unix(secs, 0), Author: f[2], Subject: f[8], Bot: botName.MatchString(f[2])}
 		d.AI = aiIdentity(f[2], f[3], f[4], f[5], f[6]) || aiMessage.MatchString(f[8]+"\n"+f[9])
 		if aiIdentity(f[2], f[3]) {
 			// an agent authored it: credit the person who launched it, named in a Co-authored-by trailer
@@ -569,7 +594,6 @@ func logChunk(o opts, f *pathFilter, hashes []string) ([]delta, error) {
 			}
 			d.Added += fs.added
 			d.Deleted += fs.deleted
-			d.ByExt[extOf(fs.path)] += fs.added - fs.deleted
 		}
 		if kept {
 			ds = append(ds, d)
@@ -611,13 +635,13 @@ func syncLedger(o opts, led ledger, since time.Time) (ledger, error) {
 		if !since.IsZero() {
 			args = append([]string{"--since=" + gitDate(since)}, args...)
 		}
-		older, err := fetchDeltas(o, args...)
-		if err != nil {
-			return ledger{}, err
-		}
 		have := make(map[string]bool, len(led.Deltas))
 		for _, d := range led.Deltas {
 			have[d.Hash] = true
+		}
+		older, err := fetchDeltas(o, args...)
+		if err != nil {
+			return ledger{}, err
 		}
 		merged := make([]delta, 0, len(older)+len(led.Deltas))
 		for _, d := range older {
@@ -636,9 +660,7 @@ func derive(o opts, led ledger, since time.Time) history {
 	var (
 		win     []commit
 		total   int
-		by      = map[string]int{}
 		base0   int
-		base0By map[string]int
 		started bool
 		prevT   time.Time
 	)
@@ -649,28 +671,20 @@ func derive(o opts, led ledger, since time.Time) history {
 		}
 		prevT = t
 		if !started && (since.IsZero() || !t.Before(since)) {
-			started, base0, base0By = true, total, maps.Clone(by)
+			started, base0 = true, total
 		}
 		total += d.Added - d.Deleted
-		for e, n := range d.ByExt {
-			by[e] += n
-		}
 		if started {
 			win = append(win, commit{Hash: d.Hash, Author: d.Author, Subject: d.Subject, AI: d.AI, Bot: d.Bot, Agent: d.Agent, T: t,
-				Total: total, Added: d.Added, Deleted: d.Deleted, ByExt: maps.Clone(by)})
+				Total: total, Added: d.Added, Deleted: d.Deleted})
 		}
 	}
 	if len(win) == 0 {
 		return history{Head: led.Head}
 	}
 
-	off, offExt := 0, map[string]int{}
-	relative := func() {
-		off = -base0
-		for e, n := range base0By {
-			offExt[e] = -n
-		}
-	}
+	off := 0
+	relative := func() { off = -base0 }
 	switch {
 	case o.author != "":
 		relative() // one person's contribution: count from the start of the window
@@ -678,21 +692,15 @@ func derive(o opts, led ledger, since time.Time) history {
 		// the ledger starts at the first commit, so the sums are the file sizes as far as commits can tell
 	default:
 		// the ledger starts mid-history: anchor its end to the actual line counts at HEAD
-		abs, absBy, err := loadBaseline(o, led.Head)
+		abs, err := baselineAt(o, led.Head)
 		if err != nil {
 			relative()
 			break
 		}
 		off = max(0, abs-total)
-		for e, n := range absBy {
-			offExt[e] = max(0, n-by[e])
-		}
 	}
 	for i := range win {
 		win[i].Total += off
-		for e, d := range offExt {
-			win[i].ByExt[e] += d
-		}
 	}
 	return history{Head: led.Head, Commits: win}
 }

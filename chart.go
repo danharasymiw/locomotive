@@ -124,67 +124,6 @@ func totalSeries(cs []commit) []series {
 	return []series{s}
 }
 
-// languageSeries plots the top extensions by final size, with the rest folded into "other".
-func languageSeries(cs []commit, top int) []series {
-	if len(cs) == 0 {
-		return nil
-	}
-	last := cs[len(cs)-1].ByExt
-	var exts []string
-	for e, n := range last {
-		if n > 0 {
-			exts = append(exts, e)
-		}
-	}
-	sort.Slice(exts, func(i, j int) bool {
-		if last[exts[i]] != last[exts[j]] {
-			return last[exts[i]] > last[exts[j]]
-		}
-		return exts[i] < exts[j]
-	})
-	keep := exts
-	if len(keep) > top {
-		keep = keep[:top]
-	}
-	isKept := map[string]bool{}
-	ss := make([]series, 0, len(keep)+1)
-	for i, e := range keep {
-		isKept[e] = true
-		ss = append(ss, series{name: e, color: palette[i%len(palette)]})
-	}
-	other := series{name: "other", color: palette[len(palette)-1]}
-	step := max(1, len(cs)/maxPoints) // each commit is a cumulative snapshot, so sampling loses nothing
-	for i := len(cs) - 1; i >= 0; i -= step {
-		c := cs[i]
-		rest := 0
-		for e, n := range c.ByExt {
-			if !isKept[e] {
-				rest += n
-			}
-		}
-		for i, e := range keep {
-			ss[i].pts = append(ss[i].pts, point{c.T, float64(c.ByExt[e])})
-		}
-		other.pts = append(other.pts, point{c.T, float64(rest)})
-	}
-	reverse := func(p []point) {
-		for i, j := 0, len(p)-1; i < j; i, j = i+1, j-1 {
-			p[i], p[j] = p[j], p[i]
-		}
-	}
-	for i := range ss {
-		reverse(ss[i].pts) // sampled newest to oldest so the last commit is always included
-	}
-	reverse(other.pts)
-	if len(exts) > top {
-		ss = append(ss, other)
-	}
-	return ss
-}
-
-// maxPoints bounds how many commits a snapshot-based series samples.
-const maxPoints = 4000
-
 func authorKey(c commit) string { return c.Author }
 
 func aiKey(c commit) string {
@@ -248,16 +187,6 @@ func groupTotals(cs []commit, upto int, key func(commit) string) map[string]int 
 		run[key(c)] += c.Added - c.Deleted
 	}
 	return run
-}
-
-func churnSeries(cs []commit) []series {
-	add := series{name: "added", color: lipgloss.Color("42")}
-	del := series{name: "deleted", color: lipgloss.Color("203")}
-	for _, c := range cs {
-		add.pts = append(add.pts, point{c.T, float64(c.Added)})
-		del.pts = append(del.pts, point{c.T, float64(c.Deleted)})
-	}
-	return []series{add, del}
 }
 
 func commas(n int) string {
@@ -360,4 +289,23 @@ func thin(ss []series, limit int) []series {
 		out[i].pts = pts
 	}
 	return out
+}
+
+// aiShare is the percentage of lines added in AI-assisted commits, over the given commits. Bot
+// accounts are left out, as in the who-uses-ai view. ok is false when nothing was added.
+func aiShare(cs []commit) (pct int, ok bool) {
+	var added, ai int
+	for _, c := range cs {
+		if c.Bot {
+			continue
+		}
+		added += c.Added
+		if c.AI {
+			ai += c.Added
+		}
+	}
+	if added == 0 {
+		return 0, false
+	}
+	return ai * 100 / added, true
 }

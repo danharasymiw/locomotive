@@ -21,11 +21,11 @@ slopmeter
 
 `tab` cycles between three views:
 
-- **history** plots lines of code at every commit. `m` switches between *total*, *languages* (one line per extension, plus a total), *churn* (lines added vs deleted per commit), *authors* (running net lines per person, mailmap-aware), *human vs ai* and *who uses ai* (one line per person: their running lines added in AI-assisted commits, bots excluded). The AI split classifies a commit as AI-assisted when a trailer, a message footer (such as `Generated with Claude Code`) or the author or committer identity names a coding agent (Claude, Copilot, Cursor, Aider, Codex, Gemini and similar), so commits without any of those count as human. Commits by automation accounts (`dependabot[bot]`, `renovate-bot` and similar) form a separate *bot* group.
+- **history** plots lines of code at every commit. `m` switches between *total*, *authors* (running net lines per person, mailmap-aware), *human vs ai* and *who uses ai* (one line per person: their running lines added in AI-assisted commits, bots excluded). The AI split classifies a commit as AI-assisted when a trailer, a message footer (such as `Generated with Claude Code`) or the author or committer identity names a coding agent (Claude, Copilot, Cursor, Aider, Codex, Gemini and similar), so commits without any of those count as human. Commits by automation accounts (`dependabot[bot]`, `renovate-bot` and similar) form a separate *bot* group.
 - **live** plots your working tree (uncommitted changes plus untracked files) once a second.
 - **worktrees** plots net uncommitted lines for every worktree of the repo at once. A worktree is tagged `[session]` when a `claude` process is running in it and `[agent]` when git has it locked, which is how Claude Code subagent worktrees appear.
 
-In the history view, move the cursor with `←`/`→` (`shift` jumps 10 commits) or the mouse to see the commit behind each point. `p` cycles the history window (1m, 3m, 6m, 1y, all), `r` rebuilds from scratch, `q` quits.
+In the history view, move the cursor with `←`/`→` (`shift` jumps 10 commits) or the mouse to see the commit behind each point. `p` cycles the history window (3m, 1y, all), `r` rebuilds from scratch, `q` quits.
 
 ### Screenshots
 
@@ -34,14 +34,6 @@ Switch between them with `m`.
 **total**: lines of code at every commit.
 
 ![total](docs/total.svg)
-
-**languages**: one line per file extension.
-
-![languages](docs/languages.svg)
-
-**churn**: lines added vs deleted per commit.
-
-![churn](docs/churn.svg)
 
 **authors**: running net lines per person.
 
@@ -68,7 +60,7 @@ Switch between them with `m`.
 | `--branch main` | branch or ref to walk (default `HEAD`) |
 | `--author me` | only commits by this author |
 | `--since 6m` | history window: `1m`, `3m` (default), `6m`, `1y`, `all` or a date like `2025-01-01` |
-| `--once` | print the chart once and exit (`--mode total\|languages\|churn\|authors\|ai\|who\|worktrees`) |
+| `--once` | print the chart once and exit (`--mode total\|authors\|ai\|who\|worktrees`) |
 | `--json`, `--csv` | print per-commit data and exit |
 
 Lockfiles, vendored dependencies, build output and common generated code (protobuf, minified JS and so on) are ignored by default. See `excludes` in `git.go`. Paths marked `linguist-generated` or `linguist-vendored` in `.gitattributes` are ignored too. Git applies the current attributes to the whole history, and needs 2.13 or newer.

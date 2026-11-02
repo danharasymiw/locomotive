@@ -20,8 +20,6 @@ type mode int
 
 const (
 	modeTotal mode = iota
-	modeLang
-	modeChurn
 	modeAuthors
 	modeAI
 	modeWho
@@ -29,7 +27,7 @@ const (
 )
 
 func (m mode) String() string {
-	return [...]string{"total", "languages", "churn", "authors", "human vs ai", "who uses ai"}[m]
+	return [...]string{"total", "authors", "human vs ai", "who uses ai"}[m]
 }
 
 // brand is the dim name tag shown next to the tabs and above -once output.
@@ -123,7 +121,7 @@ func (m model) loadHist(force bool) tea.Cmd {
 	o, led := m.o, m.led
 	return func() tea.Msg {
 		h, led, err := loadCached(o, led, force)
-		return histMsg{h, led, o.since, err}
+		return histMsg{h: h, led: led, since: o.since, err: err}
 	}
 }
 
@@ -187,16 +185,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "P" {
 				step = -1
 			}
-			for i, p := range periods {
-				if p.label == m.label {
+			for i, p := range cycle {
+				if p == m.label {
 					cur = i
 				}
 			}
-			next := (cur + step + len(periods)) % len(periods)
-			if cur < 0 { // custom --since date: start from either end
-				next = max(0, (1-step)/2*(len(periods)-1))
+			next := (cur + step + len(cycle)) % len(cycle)
+			if cur < 0 { // a --since value outside the cycle (1m, 6m, a date): start from either end
+				next = max(0, (1-step)/2*(len(cycle)-1))
 			}
-			m.o.since, m.label, _ = resolveSince(periods[next].label)
+			m.o.since, m.label, _ = resolveSince(cycle[next])
 			m.hist, m.loaded, m.cur, m.followLast, m.live = history{}, false, 0, true, nil
 			if m.dotsOn {
 				return m, m.loadHist(false)
@@ -225,8 +223,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = msg.err
 		if msg.err == nil {
+			keep := "" // the commit under the cursor, so older history arriving does not move it
+			if !m.followLast && m.cur < len(m.hist.Commits) {
+				keep = m.hist.Commits[m.cur].Hash
+			}
 			m.hist, m.led, m.loaded = msg.h, msg.led, true
-			if m.followLast || m.cur >= len(m.hist.Commits) {
+			cur := -1
+			for i, c := range m.hist.Commits {
+				if c.Hash == keep {
+					cur = i
+				}
+			}
+			switch {
+			case cur >= 0:
+				m.cur = cur
+			case m.followLast || m.cur >= len(m.hist.Commits):
 				m.cur = max(0, len(m.hist.Commits)-1)
 			}
 		}
@@ -282,6 +293,26 @@ type seriesCache struct {
 	since time.Time
 	ss    []series
 	ok    bool
+
+	// the headline AI share is kept alongside, keyed by the history it was computed for
+	shareN    int
+	shareHead string
+	share     int
+	shareOK   bool
+	shareSet  bool
+}
+
+// aiShare is the headline AI percentage for the plotted window, recomputed only when it changes.
+func (m model) aiShare() (int, bool) {
+	c := m.sc
+	if c == nil {
+		return aiShare(m.hist.Commits)
+	}
+	if !c.shareSet || c.shareN != len(m.hist.Commits) || c.shareHead != m.hist.Head {
+		c.share, c.shareOK = aiShare(m.hist.Commits)
+		c.shareN, c.shareHead, c.shareSet = len(m.hist.Commits), m.hist.Head, true
+	}
+	return c.share, c.shareOK
 }
 
 func (m model) seriesFor() []series {
@@ -291,7 +322,7 @@ func (m model) seriesFor() []series {
 	}
 	ss := m.buildSeries()
 	if c != nil {
-		*c = seriesCache{m.mode, len(m.hist.Commits), m.hist.Head, m.o.since, ss, true}
+		c.mode, c.n, c.head, c.since, c.ss, c.ok = m.mode, len(m.hist.Commits), m.hist.Head, m.o.since, ss, true
 	}
 	return ss
 }
@@ -299,10 +330,6 @@ func (m model) seriesFor() []series {
 func (m model) buildSeries() []series {
 	cs := m.hist.Commits
 	switch m.mode {
-	case modeLang:
-		return languageSeries(cs, 5)
-	case modeChurn:
-		return churnSeries(cs)
 	case modeAuthors:
 		return groupSeries(cs, authorKey, 5)
 	case modeAI:
@@ -356,6 +383,9 @@ func (m model) header() string {
 	s := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")).Render(m.o.name) + "  "
 	if len(m.hist.Commits) > 0 {
 		s += bold.Render(commas(total) + " lines")
+		if pct, ok := m.aiShare(); ok {
+			s += dim.Render(" · ") + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208")).Render(fmt.Sprintf("%d%% AI", pct))
+		}
 	} else {
 		s += bold.Render("no commits in " + m.label) // base is unknown without any commit in the window
 	}
@@ -395,20 +425,6 @@ func (m model) info() string {
 	s := fmt.Sprintf("%s  %s  %s  %s — %s lines (+%d −%d)",
 		lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(hash),
 		c.T.Format("2006-01-02"), c.Author, c.Subject, commas(c.Total), c.Added, c.Deleted)
-	if m.mode == modeLang {
-		var exts []string
-		for e, n := range c.ByExt {
-			if n > 0 {
-				exts = append(exts, e)
-			}
-		}
-		sort.Slice(exts, func(i, j int) bool { return c.ByExt[exts[i]] > c.ByExt[exts[j]] })
-		var parts []string
-		for _, e := range exts[:min(len(exts), 6)] {
-			parts = append(parts, fmt.Sprintf("%s %s", e, commas(c.ByExt[e])))
-		}
-		s += "\n" + axisStyle.Render(strings.Join(parts, " · "))
-	}
 	var key func(commit) string
 	switch m.mode {
 	case modeAuthors:
